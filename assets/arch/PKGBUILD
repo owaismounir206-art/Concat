@@ -6,7 +6,19 @@ pkgdesc="Free and open source video editor"
 arch=('x86_64' 'aarch64')
 url="https://github.com/jub0t/Concat"
 license=('AGPL-3.0-or-later')
-depends=('glibc' 'gtk3' 'fontconfig' 'freetype2' 'libxkbcommon' 'mesa' 'alsa-lib')
+# The window and the compositor draw through Vulkan alone on Linux, so the
+# loader is a hard dependency; which GPU driver sits behind it is the
+# machine's, hence optdepends. Without one, wgpu falls back to lavapipe and
+# every frame is drawn by the CPU. The bundled FFmpeg loads the system's
+# libva for hardware decoding, which Concat turns on by itself on amdgpu and
+# xe (Intel Lunar Lake and later) machines.
+depends=('glibc' 'gtk3' 'fontconfig' 'freetype2' 'libxkbcommon' 'mesa' 'alsa-lib' 'vulkan-icd-loader')
+optdepends=(
+  'vulkan-radeon: GPU preview and export on AMD Radeon (RADV)'
+  'vulkan-intel: GPU preview and export on Intel graphics (ANV)'
+  'libva: hardware video decoding (VAAPI)'
+  'intel-media-driver: VAAPI decoding on Intel Arc, Lunar Lake and newer'
+)
 options=('!strip' '!debug')
 source=()
 
