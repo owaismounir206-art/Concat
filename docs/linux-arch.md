@@ -121,6 +121,28 @@ What you can do:
 - On a laptop, plug in and pick the *Performance* power profile
   (`powerprofilesctl set performance`).
 
+### Measuring it on your machine
+
+`concat-cli bench` does the monitor's work without the window: it decodes a clip at a
+preview quality, draws it through effects on the GPU, and reports the time per frame,
+the frames a second that come to, and how much longer the first frame with new effects
+took. From a source checkout (the packages ship the editor, not the CLI):
+
+```sh
+cd Concat/src
+cargo build --profile quick -p concat-cli
+# twice: the second run starts with the pipeline cache the first one wrote
+for run in 1 2; do
+  target/quick/concat-cli bench ~/Videos/clip.mp4 --quality half \
+    --effects concat.vignette,concat.glow,concat.film-grain \
+    --pipeline-cache /tmp/concat-pipelines
+done
+```
+
+The line to read is the last one: `… fps with decoding ahead …: holds` means the machine
+draws 30 frames a second at that quality with those effects. The second line says whether
+decoding went to `VAAPI` or stayed in `software`.
+
 ### Environment variables
 
 | Variable | Effect |

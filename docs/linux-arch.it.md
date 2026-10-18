@@ -123,6 +123,28 @@ Cosa puoi fare tu:
 - Su un portatile collega l'alimentatore e scegli il profilo energetico *Performance*
   (`powerprofilesctl set performance`).
 
+### Misurarlo sulla tua macchina
+
+`concat-cli bench` fa il lavoro della preview senza la finestra: decodifica una clip alla
+qualità scelta, la disegna sulla GPU con gli effetti indicati e riporta il tempo per frame,
+gli fps che ne risultano e quanto è costato in più il primo frame con effetti nuovi. Va
+compilato dai sorgenti (i pacchetti contengono l'editor, non la CLI):
+
+```sh
+cd Concat/src
+cargo build --profile quick -p concat-cli
+# due volte: la seconda parte dalla cache delle pipeline scritta dalla prima
+for run in 1 2; do
+  target/quick/concat-cli bench ~/Video/clip.mp4 --quality half \
+    --effects concat.vignette,concat.glow,concat.film-grain \
+    --pipeline-cache /tmp/concat-pipelines
+done
+```
+
+La riga da leggere è l'ultima: `… fps with decoding ahead …: holds` significa che la
+macchina disegna 30 frame al secondo a quella qualità con quegli effetti. La seconda riga
+dice se la decodifica è andata su `VAAPI` o è rimasta in `software`.
+
 ### Variabili d'ambiente
 
 | Variabile | Effetto |
