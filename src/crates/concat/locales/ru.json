@@ -291,6 +291,7 @@
   "meters.peak": "Пик: самый громкий уровень последнего мгновения, в дБ ниже полной шкалы.",
   "modal.copied": "Скопировано",
   "monitor.previewFailed": "Просмотр не удался: {0}",
+  "monitor.softwareGpu": "No GPU Vulkan driver found: the preview is drawn by the CPU and will stutter. On Arch install vulkan-radeon (AMD) or vulkan-intel (Intel), then restart Concat.",
   "paneSwitcher.addAPanel": "Добавить панель",
   "paneSwitcher.changeWhatPanelShows": "Измените, что показывает эта панель, или перетащите её на другую",
   "paneSwitcher.inspector": "Инспектор",

@@ -291,6 +291,7 @@
   "meters.peak": "Tepe: son anın ulaştığı en yüksek seviye, tam ölçeğin altında dB olarak.",
   "modal.copied": "Kopyalandı",
   "monitor.previewFailed": "Önizleme başarısız: {0}",
+  "monitor.softwareGpu": "No GPU Vulkan driver found: the preview is drawn by the CPU and will stutter. On Arch install vulkan-radeon (AMD) or vulkan-intel (Intel), then restart Concat.",
   "paneSwitcher.addAPanel": "Panel ekle",
   "paneSwitcher.changeWhatPanelShows": "Bu panelin gösterdiğini değiştirin veya başka bir panelin üzerine sürükleyin",
   "paneSwitcher.inspector": "Denetçi",

@@ -291,6 +291,7 @@
   "meters.peak": "Picco: il livello più alto raggiunto nell’ultimo istante, in dB sotto il fondo scala.",
   "modal.copied": "Copiato",
   "monitor.previewFailed": "Anteprima fallita: {0}",
+  "monitor.softwareGpu": "Driver Vulkan della GPU non trovato: l'anteprima è disegnata dalla CPU e andrà a scatti. Su Arch installa vulkan-radeon (AMD) o vulkan-intel (Intel), poi riavvia Concat.",
   "paneSwitcher.addAPanel": "Aggiungi un pannello",
   "paneSwitcher.changeWhatPanelShows": "Cambia cosa mostra questo pannello, o trascinalo su un altro",
   "paneSwitcher.inspector": "Ispettore",

@@ -207,6 +207,13 @@ fn start(project: Option<std::path::PathBuf>, smoke: bool) -> Result<(), slint::
         || Shell::with(|_, app| app.invoke_blur()),
     )?;
 
+    // Read before the device moves into the host: on Linux a software
+    // adapter almost always means the GPU's Vulkan driver is not
+    // installed, and every frame is then drawn by the CPU (lavapipe), which
+    // no setting in the app can make smooth. Said in the window, once,
+    // since a log line is not where anyone looks for why the preview stutters.
+    let drawn_in_software =
+        cfg!(target_os = "linux") && gpu.as_ref().is_some_and(crate::gpu::Gpu::is_software);
     let host = match Host::start(gpu) {
         Ok(host) => host,
         Err(error) => {
@@ -230,6 +237,9 @@ fn start(project: Option<std::path::PathBuf>, smoke: bool) -> Result<(), slint::
     // first thing the window says.
     let mut studio = Studio::new(host);
     studio.set_phone(phone);
+    if drawn_in_software {
+        studio.notify(&crate::i18n::t("monitor.softwareGpu"), true);
+    }
     studio.reload_packages(false);
     studio.watch_packages();
     let dark = studio.prefs.dark.unwrap_or(true);

@@ -291,6 +291,7 @@
   "meters.peak": "چوٹی: پچھلے لمحے کی سب سے بلند سطح، پورے اسکیل سے نیچے dB میں۔",
   "modal.copied": "کاپی ہو گیا",
   "monitor.previewFailed": "پیش منظر ناکام: {0}",
+  "monitor.softwareGpu": "No GPU Vulkan driver found: the preview is drawn by the CPU and will stutter. On Arch install vulkan-radeon (AMD) or vulkan-intel (Intel), then restart Concat.",
   "paneSwitcher.addAPanel": "پینل شامل کریں",
   "paneSwitcher.changeWhatPanelShows": "یہ پینل جو دکھاتا ہے اسے بدلیں، یا اسے کسی دوسرے پر گھسیٹیں",
   "paneSwitcher.inspector": "انسپکٹر",

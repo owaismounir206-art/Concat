@@ -291,6 +291,7 @@
   "meters.peak": "পিক: শেষ মুহূর্তে যতটা জোরে পৌঁছেছিল, পূর্ণ স্কেলের নিচে dB-এ।",
   "modal.copied": "কপি করা হয়েছে",
   "monitor.previewFailed": "প্রিভিউ ব্যর্থ: {0}",
+  "monitor.softwareGpu": "No GPU Vulkan driver found: the preview is drawn by the CPU and will stutter. On Arch install vulkan-radeon (AMD) or vulkan-intel (Intel), then restart Concat.",
   "paneSwitcher.addAPanel": "একটি প্যানেল যোগ করুন",
   "paneSwitcher.changeWhatPanelShows": "এই প্যানেল কী দেখায় তা বদলান, অথবা অন্যটির উপর টেনে আনুন",
   "paneSwitcher.inspector": "ইন্সপেক্টর",

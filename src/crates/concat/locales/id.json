@@ -291,6 +291,7 @@
   "meters.peak": "Puncak: tingkat paling keras yang dicapai sesaat terakhir, dalam dB di bawah skala penuh.",
   "modal.copied": "Disalin",
   "monitor.previewFailed": "Pratinjau gagal: {0}",
+  "monitor.softwareGpu": "No GPU Vulkan driver found: the preview is drawn by the CPU and will stutter. On Arch install vulkan-radeon (AMD) or vulkan-intel (Intel), then restart Concat.",
   "paneSwitcher.addAPanel": "Tambah panel",
   "paneSwitcher.changeWhatPanelShows": "Ubah isi panel ini, atau seret ke panel lain",
   "paneSwitcher.inspector": "Inspektor",

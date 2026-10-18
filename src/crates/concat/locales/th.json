@@ -291,6 +291,7 @@
   "meters.peak": "พีก: ระดับดังสุดที่ช่วงล่าสุดไปถึง เป็น dB ต่ำกว่าสเกลเต็ม",
   "modal.copied": "คัดลอกแล้ว",
   "monitor.previewFailed": "แสดงตัวอย่างไม่สำเร็จ: {0}",
+  "monitor.softwareGpu": "No GPU Vulkan driver found: the preview is drawn by the CPU and will stutter. On Arch install vulkan-radeon (AMD) or vulkan-intel (Intel), then restart Concat.",
   "paneSwitcher.addAPanel": "เพิ่มแผง",
   "paneSwitcher.changeWhatPanelShows": "เปลี่ยนสิ่งที่แผงนี้แสดง หรือลากไปวางบนแผงอื่น",
   "paneSwitcher.inspector": "ตัวตรวจสอบ",

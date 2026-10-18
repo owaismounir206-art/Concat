@@ -291,6 +291,7 @@
   "meters.peak": "Spitze: der lauteste Wert des letzten Moments, in dB unter Vollaussteuerung.",
   "modal.copied": "Kopiert",
   "monitor.previewFailed": "Vorschau fehlgeschlagen: {0}",
+  "monitor.softwareGpu": "No GPU Vulkan driver found: the preview is drawn by the CPU and will stutter. On Arch install vulkan-radeon (AMD) or vulkan-intel (Intel), then restart Concat.",
   "paneSwitcher.addAPanel": "Panel hinzufügen",
   "paneSwitcher.changeWhatPanelShows": "Ändere, was dieses Panel zeigt, oder ziehe es auf ein anderes",
   "paneSwitcher.inspector": "Inspektor",

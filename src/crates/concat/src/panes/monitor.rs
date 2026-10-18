@@ -3,6 +3,9 @@
 
 //! The monitor: the frame at the playhead, one request at a time.
 //!
+//! A playback that misses frames at the quality picked plays a tier
+//! smaller until it stops; see [`Strain`].
+//!
 //! The pane owns the picture, the busy and wanted flags that serialise
 //! requests, the quality tier per timeline, and the worker that draws a
 //! frame. What goes into the frame - the flattened clips with their
@@ -91,6 +94,66 @@ pub struct MonitorPane {
     asked: Option<std::time::Instant>,
     /// How the frames of the current playback arrived.
     cadence: Cadence,
+    /// Whether the current playback keeps up, and how far below the chosen
+    /// quality it has stepped because it did not.
+    strain: Strain,
+}
+
+/// How far a playback that cannot keep up drops below the chosen quality.
+///
+/// Every second of timeline frames is a verdict: when more than a tenth of
+/// them were never shown, the machine is not keeping up at this size, and
+/// the next frames are asked for a tier smaller - Half to Quarter, Full to
+/// Half - which is a quarter of the pixels to decode, upload and run every
+/// effect over. Once, and only for this playback: it does not climb back
+/// while playing, which would make it hunt between the two, and it is
+/// forgotten when playback stops, so the paused picture is always the
+/// quality picked. The pick itself is never touched.
+#[derive(Default, Debug, PartialEq)]
+struct Strain {
+    /// Frames shown in the second being judged.
+    shown: u32,
+    /// Frames of that second that passed without being shown.
+    skipped: u32,
+    last: Option<i64>,
+    /// Tiers below the chosen one, 0 or 1.
+    step: usize,
+}
+
+impl Strain {
+    /// The share of a second's frames that may go unshown before the
+    /// quality steps down.
+    const MISSED: f64 = 0.1;
+
+    /// Counts a shown frame of timeline frame `index` at `fps`. True when
+    /// this frame stepped the quality down.
+    fn count(&mut self, index: i64, fps: f64) -> bool {
+        self.shown += 1;
+        if let Some(last) = self.last
+            && index > last + 1
+        {
+            self.skipped += u32::try_from(index - last - 1).unwrap_or(u32::MAX);
+        }
+        self.last = Some(index);
+        let second = fps.max(1.0).ceil() as u32;
+        if self.shown + self.skipped < second {
+            return false;
+        }
+        let missed = f64::from(self.skipped) / f64::from(self.shown + self.skipped);
+        self.shown = 0;
+        self.skipped = 0;
+        if self.step == 0 && missed > Self::MISSED {
+            self.step = 1;
+            return true;
+        }
+        false
+    }
+
+    /// The tier to ask for when `chosen` was picked: one smaller while
+    /// stepped down, never past Quarter.
+    fn tier(&self, chosen: usize) -> usize {
+        (chosen + self.step).min(2)
+    }
 }
 
 /// How smoothly a playback's frames reached the monitor: one line in the
@@ -149,24 +212,45 @@ impl MonitorPane {
                 let fps = studio.project().active().video.rate();
                 let wait = self.asked.take().map(|at| at.elapsed()).unwrap_or_default();
                 if spec.moving && result.is_ok() {
-                    self.cadence
-                        .count((spec.time * fps + 1e-6).floor() as i64, wait);
+                    let index = (spec.time * fps + 1e-6).floor() as i64;
+                    self.cadence.count(index, wait);
+                    if self.strain.count(index, fps) {
+                        log::info!(
+                            "playback: frames are being missed at {}x{}; playing a tier \
+                             smaller until it stops",
+                            spec.width,
+                            spec.height
+                        );
+                    }
                 } else if !spec.moving {
                     self.cadence.report(fps);
+                    self.strain = Strain::default();
                 }
                 let picture = match result {
                     // Drawn here and not on the worker: this is the event
                     // loop, the one thread the window's renderer submits
                     // from, and a second thread submitting beside it hangs
                     // the GPU - see `Monitor::texture_of`.
-                    Ok(Picture::Sources(sources)) => studio
-                        .host
-                        .monitor
-                        .texture_of(&sources, spec)
-                        .and_then(|texture| {
+                    Ok(Picture::Sources(sources)) => {
+                        let drawing = std::time::Instant::now();
+                        let drawn = studio.host.monitor.texture_of(&sources, spec);
+                        // With CONCAT_LOG=debug, where each frame's time
+                        // went: gathering it on the worker (decoding,
+                        // compiling its new effects) against drawing it
+                        // here, which is what a stutter is measured with.
+                        log::debug!(
+                            "preview frame {}x{} at {:.3}s: gathered in {} ms, drawn in {} ms",
+                            spec.width,
+                            spec.height,
+                            spec.time,
+                            wait.as_millis(),
+                            drawing.elapsed().as_millis()
+                        );
+                        drawn.and_then(|texture| {
                             slint::Image::try_from(texture)
                                 .map_err(|error| format!("preview texture: {error}"))
-                        }),
+                        })
+                    }
                     Ok(Picture::Pixels(bytes, width, height)) => {
                         let buffer =
                             slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
@@ -231,24 +315,27 @@ impl MonitorPane {
             self.wanted = true;
             return;
         }
-        let (width, height) =
-            Self::frame_size(self.quality_of(studio.project()), studio.output_size());
+        let moving = studio.playing || studio.source.as_ref().is_some_and(|source| source.playing);
+        if !moving {
+            self.strain = Strain::default();
+        }
+        // The tier picked, or one smaller while this playback cannot keep
+        // up at it; see `Strain`.
+        let quality = self.strain.tier(self.quality_of(studio.project()));
+        let (width, height) = Self::frame_size(quality, studio.output_size());
         let Some((clips, settings)) = studio.preview_clips() else {
             return;
         };
-        let quality = self.quality_of(studio.project());
         let spec = FrameSpec {
             time: f64::from(studio.preview_time()),
             width,
             height,
-            moving: studio.playing || studio.source.as_ref().is_some_and(|source| source.playing),
+            moving,
             // Playback reads the proxies at Half and Quarter; Full plays
             // the files themselves, or Full would be the proxy blurred up.
             // With proxies off in Settings it plays the files at every
             // quality, a proxy left from before included.
-            proxy: studio.prefs.proxies
-                && (studio.playing || studio.source.as_ref().is_some_and(|source| source.playing))
-                && quality > 0,
+            proxy: studio.prefs.proxies && moving && quality > 0,
             color_space: studio.project().active().video.color_space,
         };
         if !studio.playing {
@@ -329,6 +416,42 @@ mod tests {
         assert_eq!(cadence.worst, ms(40));
         cadence.report(30.0);
         assert_eq!(cadence, Cadence::default(), "a report starts over");
+    }
+
+    /// A second with more than a tenth of its frames missed steps the
+    /// quality down once; a smooth one does not; it never steps twice or
+    /// past Quarter.
+    #[test]
+    fn a_playback_that_misses_frames_plays_a_tier_smaller() {
+        let mut smooth = Strain::default();
+        assert!((0..60).all(|index| !smooth.count(index, 30.0)));
+        assert_eq!(smooth.tier(1), 1);
+
+        // Every third frame shown: two of three missed.
+        let mut strained = Strain::default();
+        let stepped: Vec<bool> = (0..12).map(|n| strained.count(n * 3, 30.0)).collect();
+        assert_eq!(
+            stepped.iter().filter(|&&step| step).count(),
+            1,
+            "{stepped:?}"
+        );
+        assert_eq!(strained.tier(0), 1, "Full plays at Half");
+        assert_eq!(strained.tier(1), 2, "Half plays at Quarter");
+        assert_eq!(strained.tier(2), 2, "and Quarter stays Quarter");
+        assert!(
+            (12..40).all(|n| !strained.count(n * 3, 30.0)),
+            "it steps down once, not again"
+        );
+
+        // A frame or two missed in a second is within what is allowed.
+        let mut nearly = Strain::default();
+        let shown = (0..30).filter(|index| index % 15 != 7);
+        assert!(
+            shown
+                .map(|index| nearly.count(index, 30.0))
+                .all(|step| !step)
+        );
+        assert_eq!(nearly.step, 0);
     }
 
     #[test]

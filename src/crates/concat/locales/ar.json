@@ -291,6 +291,7 @@
   "meters.peak": "الذروة: أعلى مستوى بلغته اللحظة الأخيرة، بالديسيبل تحت الحد الأقصى.",
   "modal.copied": "تم النسخ",
   "monitor.previewFailed": "فشلت المعاينة: {0}",
+  "monitor.softwareGpu": "No GPU Vulkan driver found: the preview is drawn by the CPU and will stutter. On Arch install vulkan-radeon (AMD) or vulkan-intel (Intel), then restart Concat.",
   "paneSwitcher.addAPanel": "إضافة لوحة",
   "paneSwitcher.changeWhatPanelShows": "غيّر ما تعرضه هذه اللوحة، أو اسحبها إلى لوحة أخرى",
   "paneSwitcher.inspector": "المراقِب",

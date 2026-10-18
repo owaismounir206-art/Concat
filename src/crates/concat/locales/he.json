@@ -291,6 +291,7 @@
   "meters.peak": "שיא: הרמה הגבוהה ביותר שהרגע האחרון הגיע אליה, ב-dB מתחת לסקאלה המלאה.",
   "modal.copied": "הועתק",
   "monitor.previewFailed": "התצוגה המקדימה נכשלה: {0}",
+  "monitor.softwareGpu": "No GPU Vulkan driver found: the preview is drawn by the CPU and will stutter. On Arch install vulkan-radeon (AMD) or vulkan-intel (Intel), then restart Concat.",
   "paneSwitcher.addAPanel": "הוספת חלונית",
   "paneSwitcher.changeWhatPanelShows": "שינוי מה שהחלונית מציגה, או גרירה שלה אל חלונית אחרת",
   "paneSwitcher.inspector": "מפקח",

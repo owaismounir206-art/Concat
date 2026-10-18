@@ -291,6 +291,7 @@
   "meters.peak": "Đỉnh: mức lớn nhất trong khoảnh khắc vừa qua, tính bằng dB dưới mức tối đa.",
   "modal.copied": "Đã sao chép",
   "monitor.previewFailed": "Xem trước thất bại: {0}",
+  "monitor.softwareGpu": "No GPU Vulkan driver found: the preview is drawn by the CPU and will stutter. On Arch install vulkan-radeon (AMD) or vulkan-intel (Intel), then restart Concat.",
   "paneSwitcher.addAPanel": "Thêm bảng",
   "paneSwitcher.changeWhatPanelShows": "Thay đổi nội dung bảng này hoặc kéo nó sang bảng khác",
   "paneSwitcher.inspector": "Trình kiểm tra",
