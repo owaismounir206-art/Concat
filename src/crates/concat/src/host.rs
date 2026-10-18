@@ -67,6 +67,7 @@ impl Host {
     pub fn start(gpu: Option<Gpu>) -> Result<Host, String> {
         let dirs = AppDirs::locate()?;
         let _ = std::fs::create_dir_all(&dirs.config);
+        dirs.keep_gpu_pipelines();
         Ok(Host {
             titles: concat_host::Titles::new(&dirs),
             cutouts: Arc::new(concat_host::Cutouts::new(&dirs.data)),

@@ -65,6 +65,14 @@ pub struct Monitor {
     early: Arc<Mutex<Vec<PathBuf>>>,
     #[cfg(feature = "gpu")]
     gpu: Option<Arc<Mutex<concat_render::WgpuCompositor>>>,
+    /// A sibling of `gpu` that only ever compiles: each frame's new
+    /// effects are compiled on it on the worker that gathers the frame
+    /// (see [`Monitor::frame_sources`]), into the pipeline cache both
+    /// share, so the event loop that draws the frame does not stall on the
+    /// driver's compile the first time an effect is shown. Only where there
+    /// is such a cache; without one the compile would happen twice.
+    #[cfg(feature = "gpu")]
+    warm: Option<Arc<Mutex<concat_render::WgpuCompositor>>>,
 }
 
 /// One kept plan and what it was built for.
@@ -96,6 +104,8 @@ impl Monitor {
             early: Arc::new(Mutex::new(Vec::new())),
             #[cfg(feature = "gpu")]
             gpu: None,
+            #[cfg(feature = "gpu")]
+            warm: None,
         }
     }
 
@@ -104,13 +114,16 @@ impl Monitor {
     /// are.
     #[cfg(feature = "gpu")]
     pub fn with_gpu(device: wgpu::Device, queue: wgpu::Queue) -> Self {
+        let compositor = concat_render::WgpuCompositor::with_device(device, queue);
+        let warm = compositor
+            .has_pipeline_cache()
+            .then(|| Arc::new(Mutex::new(compositor.sibling())));
         Self {
             pool: Arc::clone(crate::scheduler().pool()),
             plan: Arc::new(Mutex::new(None)),
             early: Arc::new(Mutex::new(Vec::new())),
-            gpu: Some(Arc::new(Mutex::new(
-                concat_render::WgpuCompositor::with_device(device, queue),
-            ))),
+            gpu: Some(Arc::new(Mutex::new(compositor))),
+            warm,
         }
     }
 
@@ -185,7 +198,20 @@ impl Monitor {
         spec: FrameSpec,
     ) -> Result<concat_export::PreviewSources, String> {
         let plan = self.plan_for(clips, settings, spec);
-        concat_export::preview_sources_of(&self.pool, &plan, spec.time, spec.proxy)
+        let sources = concat_export::preview_sources_of(&self.pool, &plan, spec.time, spec.proxy)?;
+        // Compiling is not submitting: it never touches the queue the
+        // window's renderer submits to, so unlike the drawing it is safe
+        // here, off the event loop.
+        if let Some(warm) = &self.warm {
+            let compiled = warm
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .prepare_passes(sources.plan());
+            if compiled > 0 {
+                log::debug!("preview: compiled {compiled} new effect pipelines ahead of drawing");
+            }
+        }
+        Ok(sources)
     }
 
     /// Draws [`Monitor::frame_sources`] into a texture on the device this

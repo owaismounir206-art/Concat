@@ -179,6 +179,22 @@ fn a_pass_treats_the_layer_before_it_is_placed() {
     );
 }
 
+/// A plan's passes compile ahead of drawing, once each, and a frame then
+/// drawn on that compositor draws the same picture as one compiled while
+/// drawing: what the monitor's worker does with a frame's new effects.
+#[test]
+fn passes_compile_ahead_once_and_draw_the_same() {
+    let Some(mut gpu) = gpu() else { return };
+    let red = solid(4, 4, [255, 0, 0, 255]);
+    let mut treated = layer(red);
+    treated.effects = vec![package("test.invert-ahead", INVERT, "", &[], 1.0)];
+    let plan = plan(4, 4, vec![treated]);
+    assert_eq!(gpu.prepare_passes(&plan), 1);
+    assert_eq!(gpu.prepare_passes(&plan), 0, "compiled once, not again");
+    let out = gpu.render(&plan);
+    assert_eq!(&out.pixels()[..3], &[0, 255, 255]);
+}
+
 /// A pass reads its table through `lut()`: a table that answers green
 /// to every colour turns a red frame green, and a pass without one is
 /// handed the identity and changes nothing.

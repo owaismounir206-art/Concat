@@ -29,6 +29,7 @@ mod transitions;
 
 pub use compositor::Compositor;
 pub use gpu::WgpuCompositor;
+pub use gpu::cache::set_pipeline_cache_dir;
 pub use metrics::ssim;
 pub use plan::{
     Crop, FramePlan, Geometry, PlannedLayer, PlannedTreatment, Shading, Transition, detached_clip,

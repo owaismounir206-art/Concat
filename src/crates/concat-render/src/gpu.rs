@@ -572,6 +572,10 @@ fn work_format(adapter: &wgpu::Adapter) -> wgpu::TextureFormat {
 
 /// A compositor that draws on the GPU. See the module docs.
 pub struct WgpuCompositor {
+    /// The driver's compiled pipelines, kept on disk between runs, where
+    /// the device has a pipeline cache; shared with siblings. See
+    /// `gpu/cache.rs`.
+    pipeline_cache: Option<std::sync::Arc<cache::DiskCache>>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     /// One pipeline per blend mode, indexed as `Blend::ALL` is.
@@ -766,6 +770,9 @@ impl WgpuCompositor {
                 match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                     label: Some("concat compositor"),
                     required_limits: limits_for(&adapter.limits()),
+                    // Vulkan's pipeline cache, where the adapter has one; see
+                    // gpu/cache.rs.
+                    required_features: adapter.features() & wgpu::Features::PIPELINE_CACHE,
                     ..Default::default()
                 })) {
                     Ok(opened) => opened,
@@ -837,7 +844,12 @@ impl WgpuCompositor {
     /// shares the GPU's time with this one and nothing else, so it never
     /// waits on this one's lock or evicts what this one keeps.
     pub fn sibling(&self) -> Self {
-        let mut sibling = Self::drawing_in(self.device.clone(), self.queue.clone(), self.work);
+        let mut sibling = Self::drawing_with(
+            self.device.clone(),
+            self.queue.clone(),
+            self.work,
+            self.pipeline_cache.clone(),
+        );
         sibling.uncaught = std::sync::Arc::clone(&self.uncaught);
         sibling
     }
@@ -859,6 +871,18 @@ impl WgpuCompositor {
     /// [`WgpuCompositor::with_device`], drawing in `work`: [`WORK`], or
     /// [`WORK_FALLBACK`] where the device cannot draw into that.
     fn drawing_in(device: wgpu::Device, queue: wgpu::Queue, work: wgpu::TextureFormat) -> Self {
+        let disk = cache::DiskCache::open(&device).map(std::sync::Arc::new);
+        Self::drawing_with(device, queue, work, disk)
+    }
+
+    /// [`WgpuCompositor::drawing_in`] with the pipeline cache `disk`: a new
+    /// one, or the one a sibling shares with the compositor it came from.
+    fn drawing_with(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        work: wgpu::TextureFormat,
+        disk: Option<std::sync::Arc<cache::DiskCache>>,
+    ) -> Self {
         // Read before the device moves into the compositor below.
         let budget = pool_budget_for(device.adapter_info().device_type);
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1051,7 +1075,7 @@ impl WgpuCompositor {
                     depth_stencil: None,
                     multisample: wgpu::MultisampleState::default(),
                     multiview_mask: None,
-                    cache: None,
+                    cache: disk.as_deref().map(cache::DiskCache::cache),
                 })
             })
             .collect();
@@ -1095,7 +1119,7 @@ impl WgpuCompositor {
                 depth_stencil: None,
                 multisample: wgpu::MultisampleState::default(),
                 multiview_mask: None,
-                cache: None,
+                cache: disk.as_deref().map(cache::DiskCache::cache),
             })
         });
 
@@ -1133,7 +1157,7 @@ impl WgpuCompositor {
                 depth_stencil: None,
                 multisample: wgpu::MultisampleState::default(),
                 multiview_mask: None,
-                cache: None,
+                cache: disk.as_deref().map(cache::DiskCache::cache),
             })
         };
         let upload_pipeline = copy_into(work, "fs_upload");
@@ -1196,7 +1220,7 @@ impl WgpuCompositor {
                 depth_stencil: None,
                 multisample: wgpu::MultisampleState::default(),
                 multiview_mask: None,
-                cache: None,
+                cache: disk.as_deref().map(cache::DiskCache::cache),
             })
         });
 
@@ -1235,7 +1259,12 @@ impl WgpuCompositor {
             })
             .create_view(&wgpu::TextureViewDescriptor::default());
 
+        // The built-in pipelines above went into the cache too.
+        if let Some(disk) = &disk {
+            disk.compiled();
+        }
         Self {
+            pipeline_cache: disk,
             device,
             queue,
             pipelines,
@@ -1994,6 +2023,39 @@ impl WgpuCompositor {
         }
     }
 
+    /// Compiles the pipeline of every pass `plan` draws that this
+    /// compositor has not compiled yet, and draws nothing: how a frame's
+    /// new effects are compiled on a worker, into the pipeline cache it
+    /// shares with the compositor that will draw them, so the drawing
+    /// thread finds them already in the driver's cache rather than waiting
+    /// on the compile itself (see `gpu/cache.rs`). Returns how many were
+    /// compiled; a pass the driver refuses counts, and is skipped from then
+    /// on as it is when drawn.
+    pub fn prepare_passes(&mut self, plan: &FramePlan) -> usize {
+        let passes = plan.layers.iter().flat_map(|layer| &layer.effects).chain(
+            plan.treatments
+                .iter()
+                .flat_map(|treatment| &treatment.effects),
+        );
+        let mut compiled = 0;
+        for pass in passes {
+            if self.shaders.contains_key(&pass.key) || self.refused.contains(&pass.key) {
+                continue;
+            }
+            self.shader(pass);
+            compiled += 1;
+        }
+        compiled
+    }
+
+    /// Whether this compositor keeps the driver's compiled pipelines on
+    /// disk: a Vulkan device, with a folder named for them. A sibling made
+    /// from this one shares the cache, which is what makes compiling on
+    /// one ([`WgpuCompositor::prepare_passes`]) save time on the other.
+    pub fn has_pipeline_cache(&self) -> bool {
+        self.pipeline_cache.is_some()
+    }
+
     /// Lets the pool go down to `share` of its budget, least recently drawn
     /// first: what the monitor asks for when playback stops, so a pool that
     /// filled while frames streamed past does not keep that memory while
@@ -2540,7 +2602,7 @@ impl WgpuCompositor {
                     depth_stencil: None,
                     multisample: wgpu::MultisampleState::default(),
                     multiview_mask: None,
-                    cache: None,
+                    cache: self.pipeline_cache.as_deref().map(cache::DiskCache::cache),
                 })
         };
         let pipeline = pipeline_of("fs_main");
@@ -2595,6 +2657,9 @@ impl WgpuCompositor {
                 stages,
             },
         );
+        if let Some(disk) = &self.pipeline_cache {
+            disk.compiled();
+        }
     }
 
     /// Group 0 of a package whose passes draw `pictures` pictures: the
@@ -2669,7 +2734,7 @@ impl WgpuCompositor {
                 depth_stencil: None,
                 multisample: wgpu::MultisampleState::default(),
                 multiview_mask: None,
-                cache: None,
+                cache: self.pipeline_cache.as_deref().map(cache::DiskCache::cache),
             });
         if let Some(error) = pollster::block_on(scope.pop()) {
             log::error!(
@@ -2715,6 +2780,9 @@ impl WgpuCompositor {
                 stages: Vec::new(),
             },
         );
+        if let Some(disk) = &self.pipeline_cache {
+            disk.compiled();
+        }
     }
 
     /// The render pass that combines two pictures through `pass`, the
@@ -3557,5 +3625,6 @@ impl WgpuCompositor {
     }
 }
 
+pub mod cache;
 #[cfg(test)]
 mod tests;

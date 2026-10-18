@@ -78,6 +78,15 @@ impl AppDirs {
         }
     }
 
+    /// Names `pipelines` under `data` as the folder the GPU's compiled
+    /// pipelines are kept in between runs, for every compositor made from
+    /// now on: what spares an effect's first frame the driver's compile
+    /// (concat-render's `gpu/cache.rs`). Called once, before the first
+    /// compositor is made.
+    pub fn keep_gpu_pipelines(&self) {
+        concat_render::set_pipeline_cache_dir(self.data.join("pipelines"));
+    }
+
     /// Both directories under one root. For tests, and for anyone running
     /// a portable build out of a folder.
     pub fn under(root: &Path) -> AppDirs {
@@ -90,7 +99,7 @@ impl AppDirs {
 
 /// The folders under `data`, each named where it is made: models, caches
 /// and logs. What is not listed is the settings', and stays in `config`.
-const DATA_FOLDERS: [&str; 7] = [
+const DATA_FOLDERS: [&str; 8] = [
     "cutout-models",  // concat-vision, models.rs
     "whisper-models", // concat-speech, transcribe.rs
     "tts-models",     // concat-speech, tts.rs
@@ -98,6 +107,7 @@ const DATA_FOLDERS: [&str; 7] = [
     "titles",         // titles.rs
     "updates",        // updates.rs
     "logs",           // logs.rs
+    "pipelines",      // AppDirs::keep_gpu_pipelines
 ];
 
 /// Moves what an older build kept under `from` - Windows kept models and

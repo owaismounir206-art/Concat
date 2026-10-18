@@ -96,6 +96,10 @@ impl Gpu {
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("concat"),
             required_limits: adapter.limits(),
+            // Vulkan's pipeline cache, where the adapter has one: what keeps
+            // an effect's first frame from waiting on the driver's compile
+            // in every run after the first (concat-render's gpu/cache.rs).
+            required_features: adapter.features() & wgpu::Features::PIPELINE_CACHE,
             ..Default::default()
         }))
         .ok()?;
