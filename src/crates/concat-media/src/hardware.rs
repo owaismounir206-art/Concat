@@ -26,9 +26,15 @@
 //! device instead, which is what the tests do.
 //!
 //! The device is the platform's own: VideoToolbox on macOS and iOS, D3D11VA
-//! on Windows, MediaCodec on Android. VAAPI on Linux is never chosen by
-//! default and only ever by name, because on an Intel i915 it has hung the
-//! GPU for every process on the machine until a reboot (issue #70).
+//! on Windows, MediaCodec on Android. On Linux it is VAAPI, but only on a
+//! render node whose kernel driver has not hung the machine with it:
+//! `amdgpu`, every Radeon of the last decade, and `xe`, the driver Intel's
+//! Lunar Lake and later chips run on. The older Intel driver, `i915`, has
+//! hung the GPU for every process on the machine until a reboot (issue
+//! #70), so there, and on any driver not named, VAAPI is chosen only by
+//! name. `CONCAT_HWDEC` overrides the choice: `vaapi` asks for it whatever
+//! the driver, `off` keeps every platform in software; see
+//! [`linux_vaapi_node`].
 //!
 //! ## What happens when it does not work
 //!
@@ -83,14 +89,22 @@ impl HwDevice {
     ];
 
     /// The device this binary's platform has, or `None` where there is no
-    /// device worth choosing unasked: Linux, whose VAAPI is opt-in only.
+    /// device worth choosing unasked: Linux on a driver VAAPI is not known
+    /// to be safe on, see [`linux_vaapi_node`]. `CONCAT_HWDEC=off` makes
+    /// it `None` everywhere.
     pub fn platform_default() -> Option<Self> {
+        let asked = Override::from_env();
+        if asked == Override::Off {
+            return None;
+        }
         if cfg!(any(target_os = "macos", target_os = "ios")) {
             Some(HwDevice::VideoToolbox)
         } else if cfg!(target_os = "windows") {
             Some(HwDevice::D3d11va)
         } else if cfg!(target_os = "android") {
             Some(HwDevice::MediaCodec)
+        } else if cfg!(target_os = "linux") && linux_vaapi_node().is_some() {
+            Some(HwDevice::Vaapi)
         } else {
             None
         }
@@ -141,6 +155,110 @@ impl HwDevice {
             HwDevice::MediaCodec => sys::AVHWDeviceType::MEDIACODEC,
             HwDevice::Vaapi => sys::AVHWDeviceType::VAAPI,
         }
+    }
+}
+
+/// What `CONCAT_HWDEC` asks for, when it asks for anything.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Override {
+    /// Unset, empty or `auto`: the platform's own choice.
+    Auto,
+    /// `vaapi`: VAAPI on Linux whatever the driver - the way to try it on
+    /// an i915 machine, knowing issue #70.
+    Vaapi,
+    /// `off`, `0` or `software`: no device on any platform.
+    Off,
+}
+
+impl Override {
+    fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "vaapi" | "1" | "on" => Override::Vaapi,
+            "off" | "0" | "software" | "none" => Override::Off,
+            _ => Override::Auto,
+        }
+    }
+
+    fn from_env() -> Self {
+        std::env::var("CONCAT_HWDEC").map_or(Override::Auto, |value| Self::parse(&value))
+    }
+}
+
+/// Whether VAAPI is chosen unasked on a render node driven by `driver`,
+/// the kernel module's name as sysfs gives it. The list is the drivers
+/// whose VAAPI has decoded for people without taking the machine down
+/// with it; `i915` is left off it for issue #70.
+pub fn vaapi_safe_on(driver: &str) -> bool {
+    matches!(driver, "amdgpu" | "xe")
+}
+
+/// The render node VAAPI should open on this machine, with the name of
+/// the kernel driver behind it, or `None` when no node is one it is safe
+/// to choose unasked. The first node on a safe driver wins, which on a
+/// laptop with one GPU is the only node there is, and on a desk with an
+/// integrated chip beside a card is whichever the kernel numbered first;
+/// `CONCAT_HWDEC=vaapi` takes the first node whatever its driver.
+/// Read once: the nodes a machine has do not change under a running app
+/// that would care.
+pub fn linux_vaapi_node() -> Option<(std::path::PathBuf, String)> {
+    static NODE: std::sync::OnceLock<Option<(std::path::PathBuf, String)>> =
+        std::sync::OnceLock::new();
+    NODE.get_or_init(|| {
+        let nodes = render_nodes(std::path::Path::new("/sys/class/drm"));
+        let found = choose_node(&nodes, Override::from_env());
+        match &found {
+            Some((node, driver)) => log::info!("VAAPI on {} ({driver})", node.display()),
+            None if !nodes.is_empty() => log::info!(
+                "VAAPI not chosen: no render node on a driver it is known to be safe on ({}); \
+                 CONCAT_HWDEC=vaapi asks for it anyway",
+                nodes
+                    .iter()
+                    .map(|(_, driver)| driver.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            None => {}
+        }
+        found
+    })
+    .clone()
+}
+
+/// Every render node under `sysfs` (`/sys/class/drm` on a real machine),
+/// in the kernel's order, as its `/dev/dri` path and its driver's name.
+fn render_nodes(sysfs: &std::path::Path) -> Vec<(std::path::PathBuf, String)> {
+    let Ok(entries) = std::fs::read_dir(sysfs) else {
+        return Vec::new();
+    };
+    let mut nodes: Vec<(u32, std::path::PathBuf, String)> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let number: u32 = name.strip_prefix("renderD")?.parse().ok()?;
+            let driver = std::fs::read_link(entry.path().join("device/driver")).ok()?;
+            let driver = driver.file_name()?.to_string_lossy().into_owned();
+            Some((number, std::path::Path::new("/dev/dri").join(&name), driver))
+        })
+        .collect();
+    nodes.sort_by_key(|(number, _, _)| *number);
+    nodes
+        .into_iter()
+        .map(|(_, path, driver)| (path, driver))
+        .collect()
+}
+
+/// The node [`linux_vaapi_node`] picks from `nodes` under `asked`.
+fn choose_node(
+    nodes: &[(std::path::PathBuf, String)],
+    asked: Override,
+) -> Option<(std::path::PathBuf, String)> {
+    match asked {
+        Override::Off => None,
+        Override::Vaapi => nodes.first().cloned(),
+        Override::Auto => nodes
+            .iter()
+            .find(|(_, driver)| vaapi_safe_on(driver))
+            .cloned(),
     }
 }
 
@@ -269,17 +387,21 @@ unsafe impl Sync for Device {}
 impl Device {
     fn create(kind: HwDevice) -> Result<Self, ffmpeg::Error> {
         let mut context: *mut sys::AVBufferRef = ptr::null_mut();
-        // SAFETY: the out-pointer is a valid local; a null device name and
-        // no options ask for the platform's default device, which is the
-        // only one a laptop has.
+        // VAAPI opens on the node that was judged safe, not on libva's own
+        // first guess, which on a machine with two GPUs may be the other
+        // one. Everywhere else a null name asks for the platform's default
+        // device, which is the only one a laptop has.
+        let node = match kind {
+            HwDevice::Vaapi => linux_vaapi_node().and_then(|(node, _)| {
+                std::ffi::CString::new(node.to_string_lossy().into_owned()).ok()
+            }),
+            _ => None,
+        };
+        let name = node.as_ref().map_or(ptr::null(), |node| node.as_ptr());
+        // SAFETY: the out-pointer is a valid local, and `name` is null or a
+        // NUL-terminated string that outlives the call.
         let ret = unsafe {
-            sys::av_hwdevice_ctx_create(
-                &mut context,
-                kind.av_type(),
-                ptr::null(),
-                ptr::null_mut(),
-                0,
-            )
+            sys::av_hwdevice_ctx_create(&mut context, kind.av_type(), name, ptr::null_mut(), 0)
         };
         if ret < 0 || context.is_null() {
             return Err(ffmpeg::Error::from(ret));
@@ -501,11 +623,102 @@ mod tests {
     }
 
     #[test]
-    fn the_platform_default_is_never_vaapi() {
-        assert_ne!(HwDevice::platform_default(), Some(HwDevice::Vaapi));
+    fn the_platform_default_is_vaapi_only_on_linux() {
+        if !cfg!(target_os = "linux") {
+            assert_ne!(HwDevice::platform_default(), Some(HwDevice::Vaapi));
+        }
         if cfg!(target_os = "macos") {
             assert_eq!(HwDevice::platform_default(), Some(HwDevice::VideoToolbox));
         }
+    }
+
+    /// AMD's driver and Intel's new one are chosen unasked; the old Intel
+    /// one, which hung machines (issue #70), and anything unknown are not.
+    #[test]
+    fn vaapi_is_chosen_unasked_only_on_drivers_it_has_not_hung() {
+        assert!(vaapi_safe_on("amdgpu"));
+        assert!(vaapi_safe_on("xe"));
+        assert!(!vaapi_safe_on("i915"));
+        assert!(!vaapi_safe_on("nouveau"));
+        assert!(!vaapi_safe_on("nvidia"));
+        assert!(!vaapi_safe_on(""));
+    }
+
+    #[test]
+    fn the_override_reads_what_a_person_would_type() {
+        assert_eq!(Override::parse(""), Override::Auto);
+        assert_eq!(Override::parse("auto"), Override::Auto);
+        assert_eq!(Override::parse(" VAAPI "), Override::Vaapi);
+        assert_eq!(Override::parse("on"), Override::Vaapi);
+        assert_eq!(Override::parse("off"), Override::Off);
+        assert_eq!(Override::parse("0"), Override::Off);
+        assert_eq!(Override::parse("software"), Override::Off);
+        assert_eq!(Override::parse("something"), Override::Auto);
+    }
+
+    /// The first safe node wins over an unsafe one numbered before it; an
+    /// override takes the first node whatever it is, or none.
+    #[test]
+    fn the_node_is_the_first_on_a_safe_driver() {
+        let node = |n: &str, driver: &str| (std::path::PathBuf::from(n), driver.to_owned());
+        let hybrid = [
+            node("/dev/dri/renderD128", "i915"),
+            node("/dev/dri/renderD129", "amdgpu"),
+        ];
+        assert_eq!(
+            choose_node(&hybrid, Override::Auto),
+            Some(node("/dev/dri/renderD129", "amdgpu"))
+        );
+        assert_eq!(
+            choose_node(&hybrid, Override::Vaapi),
+            Some(node("/dev/dri/renderD128", "i915"))
+        );
+        assert_eq!(choose_node(&hybrid, Override::Off), None);
+        assert_eq!(
+            choose_node(&[node("/dev/dri/renderD128", "i915")], Override::Auto),
+            None
+        );
+        assert_eq!(choose_node(&[], Override::Auto), None);
+    }
+
+    /// Render nodes are read off sysfs in the kernel's numeric order, each
+    /// with the name its driver link ends in; cards and connectors beside
+    /// them are not nodes.
+    #[cfg(unix)]
+    #[test]
+    fn render_nodes_are_read_off_sysfs_in_order() {
+        let root = std::env::temp_dir().join(format!("concat-drm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let drivers = root.join("drivers");
+        for driver in ["xe", "amdgpu"] {
+            std::fs::create_dir_all(drivers.join(driver)).unwrap();
+        }
+        let drm = root.join("drm");
+        for (name, driver) in [
+            ("renderD129", "amdgpu"),
+            ("renderD128", "xe"),
+            ("card0", "xe"),
+        ] {
+            let device = drm.join(name).join("device");
+            std::fs::create_dir_all(&device).unwrap();
+            std::os::unix::fs::symlink(drivers.join(driver), device.join("driver")).unwrap();
+        }
+        let nodes = render_nodes(&drm);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(
+            nodes,
+            vec![
+                (
+                    std::path::PathBuf::from("/dev/dri/renderD128"),
+                    "xe".to_owned()
+                ),
+                (
+                    std::path::PathBuf::from("/dev/dri/renderD129"),
+                    "amdgpu".to_owned()
+                ),
+            ]
+        );
+        assert!(render_nodes(&root.join("absent")).is_empty());
     }
 
     #[test]

@@ -30,7 +30,9 @@ pub use decode::{ColorRange, ColorSignal, DecodeOptions, Decoder, FrameSource, S
 pub use encode::{EncodeOptions, Encoder, FrameSink, RateMode, VideoCodec, jpeg};
 pub use error::{Error, Result};
 pub use ffi::{init, linked_version};
-pub use hardware::{HwDevice, HwPolicy, hardware_decode, set_hardware_decode};
+pub use hardware::{
+    HwDevice, HwPolicy, hardware_decode, linux_vaapi_node, set_hardware_decode, vaapi_safe_on,
+};
 pub use peaks::{Peaks, Pyramid};
 pub use pool::{CacheStats, FrameCache, FrameRequest, ReaderPool};
 pub use prefetch::{Cursor, Direction, Moment, Prefetcher, Priority};
