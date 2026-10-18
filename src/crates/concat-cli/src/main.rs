@@ -12,7 +12,10 @@
 //! `preview` draws one effect's card the way the window draws the
 //! catalogue's: a still through the package's own shader on the GPU. `check` is what an author runs on
 //! an effect package before sharing it: the same load the window does, its
-//! fixtures, and its probes on the GPU, with every fault named.
+//! fixtures, and its probes on the GPU, with every fault named. `bench`
+//! times the monitor's work on this machine: a clip decoded at a preview
+//! quality and drawn through effects on the GPU, frame by frame, with the
+//! first frame's compile told apart from the frames after it.
 
 use std::error::Error;
 use std::io::{BufRead, Write};
@@ -111,6 +114,39 @@ enum Command {
         height: u32,
     },
 
+    /// Time the monitor's work on this machine: `input` decoded at a
+    /// preview quality and drawn through `effects` on the GPU the way the
+    /// window draws a frame, then how long each part took, the frames a
+    /// second that come to, and whether the first frame with the effects
+    /// had to wait on compiling them:
+    /// `concat-cli bench clip.mp4 --effects concat.vignette,concat.glow`.
+    Bench {
+        /// The clip to play.
+        input: PathBuf,
+        /// Effect ids, comma-separated, drawn in order at their defaults.
+        #[arg(
+            long,
+            value_delimiter = ',',
+            default_value = "concat.vignette,concat.glow"
+        )]
+        effects: Vec<String>,
+        /// The monitor's quality: full, half or quarter of the clip's size.
+        #[arg(long, default_value = "half")]
+        quality: String,
+        /// How many frames to time.
+        #[arg(long, default_value_t = 150)]
+        frames: u64,
+        /// Where to keep the GPU's compiled pipelines between runs, as the
+        /// window does under its data folder; a second run then shows what
+        /// the window's second start costs. None by default: every run
+        /// compiles from nothing.
+        #[arg(long)]
+        pipeline_cache: Option<PathBuf>,
+        /// The frame rate the timing is held against.
+        #[arg(long, default_value_t = 30.0)]
+        target_fps: f64,
+    },
+
     /// Check effect packages before sharing them: load each folder the way
     /// the window does, hold its id against the built-ins, run its
     /// fixtures and its probes, and name every fault. `path` is one package folder - the
@@ -150,6 +186,21 @@ fn main() -> Result<(), Box<dyn Error>> {
             height,
         } => preview(&input, &output, &effect, width, height),
         Command::Check { path } => check(&path),
+        Command::Bench {
+            input,
+            effects,
+            quality,
+            frames,
+            pipeline_cache,
+            target_fps,
+        } => bench(
+            &input,
+            &effects,
+            &quality,
+            frames,
+            pipeline_cache,
+            target_fps,
+        ),
     }
 }
 
@@ -462,6 +513,185 @@ fn render(input: &PathBuf, output: &PathBuf, frames: u64, fade: u64) -> Result<(
     Ok(())
 }
 
+/// The monitor's frame size at `quality` for a clip of `width` by
+/// `height`: the window's tiers, rounded to even sides as it rounds them.
+fn bench_size(quality: &str, (width, height): (u32, u32)) -> Result<(u32, u32), String> {
+    let scale = match quality.to_ascii_lowercase().as_str() {
+        "full" => 1.0,
+        "half" => 0.5,
+        "quarter" => 0.25,
+        other => return Err(format!("quality {other:?}: full, half or quarter")),
+    };
+    let side = |px: u32| ((f64::from(px) * scale).round() as u32).max(2) & !1;
+    Ok((side(width), side(height)))
+}
+
+/// What a list of durations comes to: the mean, the 95th percentile and
+/// the worst, in milliseconds.
+fn spread(times: &[std::time::Duration]) -> (f64, f64, f64) {
+    if times.is_empty() {
+        return (0.0, 0.0, 0.0);
+    }
+    let mut ms: Vec<f64> = times
+        .iter()
+        .map(|time| time.as_secs_f64() * 1000.0)
+        .collect();
+    ms.sort_by(f64::total_cmp);
+    let mean = ms.iter().sum::<f64>() / ms.len() as f64;
+    let p95 = ms[((ms.len() as f64 * 0.95).ceil() as usize).clamp(1, ms.len()) - 1];
+    (mean, p95, ms[ms.len() - 1])
+}
+
+/// The bench: see [`Command::Bench`]. Decoding is timed apart from
+/// drawing, since the window decodes ahead on workers while it draws on
+/// the event loop; the frames a second it reports are the drawing's, the
+/// slower of the two when decoding cannot keep ahead, and both in a row.
+fn bench(
+    input: &Path,
+    effects: &[String],
+    quality: &str,
+    frames: u64,
+    pipeline_cache: Option<PathBuf>,
+    target_fps: f64,
+) -> Result<(), Box<dyn Error>> {
+    use std::time::{Duration, Instant};
+
+    if let Some(folder) = pipeline_cache {
+        concat_render::set_pipeline_cache_dir(folder);
+    }
+    // What the window turns on at start: the platform's decoder, VAAPI on
+    // an amdgpu or xe machine.
+    concat_media::set_hardware_decode(true);
+
+    let catalogue = concat_effects::Catalogue::builtin();
+    let passes = effects
+        .iter()
+        .filter(|id| !id.trim().is_empty())
+        .map(|id| {
+            let package = catalogue
+                .get(id.trim())
+                .ok_or_else(|| format!("no package answers to {id}"))?;
+            package
+                .pass(&package.params_at(concat_effects::At::Default), None)
+                .ok_or_else(|| format!("{id} has no shader to draw with"))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
+    let info = concat_media::probe(input)?;
+    let video = info.require_video()?;
+    let rate = video.frame_rate;
+    let (width, height) = bench_size(quality, (video.width, video.height))?;
+    let timeline = single_clip_timeline(&input.to_path_buf(), width, height, rate, frames);
+    let pool = ReaderPool::with_defaults();
+    let mut compositor =
+        WgpuCompositor::new().ok_or("no GPU or software renderer is available to draw with")?;
+    let adapter = compositor.adapter_info();
+    println!(
+        "{}: {}x{} at {rate}, monitor {width}x{height} ({quality}), {} effect(s)",
+        input.display(),
+        video.width,
+        video.height,
+        passes.len()
+    );
+    println!(
+        "GPU {} ({:?}, {:?}), decode {}, pipeline cache {}",
+        adapter.name,
+        adapter.device_type,
+        adapter.backend,
+        concat_media::HwPolicy::Preference
+            .device()
+            .map_or("software", |device| device.label()),
+        if compositor.has_pipeline_cache() {
+            "on"
+        } else {
+            "off"
+        }
+    );
+
+    let mut decoding = Vec::new();
+    let mut drawing = Vec::new();
+    let mut first: Option<(Duration, Duration)> = None;
+    for index in 0..frames {
+        let mut plan = plan_frame(&timeline, rate.time_of_frame(index as i64));
+        let decoded = Instant::now();
+        for layer in &mut plan.layers {
+            layer.source = Some(pool.frame_at(
+                &layer.media,
+                layer.source_time,
+                width,
+                height,
+                false,
+                None,
+                None,
+                None,
+                true,
+            )?);
+            layer.effects = passes.clone();
+        }
+        let decoded = decoded.elapsed();
+        let drawn = Instant::now();
+        // Compiled first, as the monitor's worker compiles a frame's new
+        // effects before the event loop draws it: the first frame's wait
+        // is then the compile, and the draw after it is a draw.
+        let compiling = Instant::now();
+        compositor.prepare_passes(&plan);
+        let compiled = compiling.elapsed();
+        compositor
+            .render_texture(&plan)
+            .ok_or("the GPU device was lost")?;
+        if !compositor.finish() {
+            return Err("the GPU did not finish the frame".into());
+        }
+        let drawn = drawn.elapsed();
+        if first.is_none() {
+            first = Some((compiled, drawn - compiled));
+            continue;
+        }
+        decoding.push(decoded);
+        drawing.push(drawn);
+    }
+
+    let budget = 1000.0 / target_fps;
+    let (decode_mean, decode_p95, decode_worst) = spread(&decoding);
+    let (draw_mean, draw_p95, draw_worst) = spread(&drawing);
+    let both: Vec<Duration> = decoding
+        .iter()
+        .zip(&drawing)
+        .map(|(a, b)| *a + *b)
+        .collect();
+    let (both_mean, both_p95, _) = spread(&both);
+    // Some drivers compile when a pipeline is made, others - lavapipe
+    // among them - when it is first drawn with, so the stall is told as
+    // what the first frame cost beyond a steady one, wherever it fell.
+    if let Some((compiled, drawn)) = first {
+        let compiled = compiled.as_secs_f64() * 1000.0;
+        let drawn = drawn.as_secs_f64() * 1000.0;
+        println!(
+            "first frame with the effects: preparing {compiled:.1} ms, drawing {drawn:.1} ms; \
+             {:.1} ms beyond a steady frame",
+            (compiled + drawn - draw_mean).max(0.0)
+        );
+    }
+    println!(
+        "decode   mean {decode_mean:6.2} ms  p95 {decode_p95:6.2} ms  worst {decode_worst:6.2} ms"
+    );
+    println!("draw     mean {draw_mean:6.2} ms  p95 {draw_p95:6.2} ms  worst {draw_worst:6.2} ms");
+    println!("in a row mean {both_mean:6.2} ms  p95 {both_p95:6.2} ms");
+    let ahead = decode_p95.max(draw_p95);
+    println!(
+        "{:.1} fps with decoding ahead (the window's way), {:.1} fps in a row; \
+         {target_fps} fps needs {budget:.1} ms a frame: {}",
+        1000.0 / ahead.max(f64::EPSILON),
+        1000.0 / both_p95.max(f64::EPSILON),
+        if ahead <= budget {
+            "holds"
+        } else {
+            "does not hold"
+        }
+    );
+    Ok(())
+}
+
 fn single_clip_timeline(
     input: &PathBuf,
     width: u32,
@@ -500,6 +730,22 @@ mod tests {
         assert_eq!(fade_in(5, 10), 0.5);
         assert_eq!(fade_in(10, 10), 1.0);
         assert_eq!(fade_in(99, 10), 1.0);
+    }
+
+    #[test]
+    fn the_bench_sizes_the_monitor_as_the_window_does() {
+        assert_eq!(bench_size("half", (1920, 1080)), Ok((960, 540)));
+        assert_eq!(bench_size("Quarter", (3840, 2160)), Ok((960, 540)));
+        assert_eq!(bench_size("full", (1001, 1001)), Ok((1000, 1000)));
+        assert!(bench_size("double", (1920, 1080)).is_err());
+    }
+
+    #[test]
+    fn the_spread_is_the_mean_the_95th_and_the_worst() {
+        let ms = std::time::Duration::from_millis;
+        let times: Vec<_> = (1..=20).map(ms).collect();
+        assert_eq!(spread(&times), (10.5, 19.0, 20.0));
+        assert_eq!(spread(&[]), (0.0, 0.0, 0.0));
     }
 
     #[test]
