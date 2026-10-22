@@ -331,8 +331,12 @@ mod tests {
     #[test]
     fn built_in_ids_are_namespaced_and_bare_aliases_still_resolve() {
         let catalogue = Catalogue::builtin();
+        // The built-ins live in two namespaces: `concat.` for the
+        // catalogue proper, and `lab.` for the experimental looks
+        // (Corona, Halation) that ship beside it.
         for package in catalogue.packages() {
-            assert!(package.id().starts_with("concat."), "{}", package.id());
+            let id = package.id();
+            assert!(id.starts_with("concat.") || id.starts_with("lab."), "{id}");
         }
         assert_eq!(catalogue.get("glow").map(Package::id), Some("concat.glow"));
         assert_eq!(
