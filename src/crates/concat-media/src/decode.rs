@@ -576,12 +576,6 @@ pub struct Decoder {
     /// The device the codec is on and the pixel format its frames arrive
     /// in, or `None` in software, which is also where a failed device ends.
     hardware: Option<(HwDevice, Pixel)>,
-    /// The device's scaler between the codec and the copy back, built on
-    /// the first frame that is worth shrinking; see `hardware::shrink_size`.
-    shrinker: Option<hardware::Shrinker>,
-    /// The device would not shrink a frame, once: every frame after it is
-    /// copied back whole, as before there was a shrinker.
-    shrink_refused: bool,
     /// The last picture's timestamp, for picking up in software after it.
     last_pts: Option<Rational>,
     /// The output frame instant the pacer is at, when pacing.
@@ -696,8 +690,6 @@ impl Decoder {
             discard_before: None,
             discard_through: None,
             hardware: accelerated,
-            shrinker: None,
-            shrink_refused: false,
             last_pts: None,
             tick: 0,
             origin: Rational::ZERO,
@@ -852,8 +844,7 @@ impl Decoder {
                     }
                     if let Some((device, format)) = self.hardware {
                         if frame.format() == format {
-                            let shrunk = self.shrink_on_device(&frame);
-                            frame = match hardware::download(shrunk.as_ref().unwrap_or(&frame)) {
+                            frame = match hardware::download(&frame) {
                                 Ok(copy) => copy,
                                 Err(error) => {
                                     hardware::note_fallback(
@@ -928,35 +919,6 @@ impl Decoder {
                     }
                     Err(error) => return Err(ffi::fail("read", &self.path, error)),
                 }
-            }
-        }
-    }
-
-    /// `frame`, still on the device, shrunk there to about the size this
-    /// reader hands out, or `None` to copy it back whole: off VAAPI, for a
-    /// picture no larger than that, under a pre-chain (a crop is in the
-    /// source's own pixels), and from the first frame the device's scaler
-    /// refused on. A refusal is said once and is not an error; the copy
-    /// costs what it always did. See `hardware::shrink_size`.
-    fn shrink_on_device(&mut self, frame: &Video) -> Option<Video> {
-        if self.shrink_refused
-            || self.options.pre_chain.is_some()
-            || self.hardware.map(|(device, _)| device) != Some(HwDevice::Vaapi)
-        {
-            return None;
-        }
-        let size = hardware::shrink_size(
-            (frame.width(), frame.height()),
-            (self.width, self.height),
-            self.rotation,
-        )?;
-        match hardware::Shrinker::shrink(&mut self.shrinker, frame, size, self.time_base) {
-            Ok(shrunk) => Some(shrunk),
-            Err(error) => {
-                hardware::note_shrink_refused(&error.to_string());
-                self.shrink_refused = true;
-                self.shrinker = None;
-                None
             }
         }
     }
