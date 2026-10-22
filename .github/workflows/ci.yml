@@ -149,15 +149,17 @@ jobs:
       # before tests: they finish in a fraction of the time and catch the
       # most.
       - run: cargo clippy --workspace --all-targets -- -D warnings
-        timeout-minutes: 25
+        timeout-minutes: 40
         working-directory: src
 
       # The tests are compiled in a step of their own, so a slow compile
       # and a slow test are told apart by which step ran out of time. One
       # job at a time and no debug info, to stay inside the runner's
       # memory; the run below finds everything already built.
+      # Fifty: a fork's first run, or one whose cache did not save, builds
+      # the whole tree from nothing, which ran past twenty-five.
       - name: Build the tests
-        timeout-minutes: 25
+        timeout-minutes: 50
         working-directory: src
         env:
           CARGO_PROFILE_DEV_DEBUG: "0"
