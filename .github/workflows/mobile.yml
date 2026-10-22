@@ -285,6 +285,12 @@ jobs:
     needs: android
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    # Android 11's emulator on GitHub's runners now comes up with no Vulkan
+    # adapter at all ("vulkan found no adapters"), so the app cannot open
+    # its window there whatever it carries; Android 15's starts the same
+    # APK. That one still gates a release; Android 11's runs and reports,
+    # and a failure there shows in the run without holding the release.
+    continue-on-error: ${{ matrix.api == 30 }}
     strategy:
       fail-fast: false
       matrix:
