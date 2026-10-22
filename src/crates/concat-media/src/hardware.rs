@@ -571,6 +571,152 @@ pub(crate) fn download(frame: &Video) -> Result<Video, ffmpeg::Error> {
     Ok(copy)
 }
 
+/// The size a picture coded at `coded` is shrunk to on the device before
+/// it is copied back, so that once turned by `rotation` it is the
+/// `target` the reader was asked for - or `None` where shrinking first
+/// would not make the copy smaller.
+///
+/// The copy back is what a 4K stream on VAAPI pays for most: every frame,
+/// twelve megabytes of NV12 or twenty-four of P010 read out of the GPU's
+/// memory, on an integrated chip the same memory the CPU then reads them
+/// out of again to shrink them to the monitor's size. Shrunk on the
+/// device's own scaler first, a Half monitor copies a quarter of that.
+/// The sides are rounded up to even, as the chroma of NV12 needs; the
+/// filtergraph's own scale then lands the picture on the exact size, as
+/// it always has.
+pub(crate) fn shrink_size(
+    coded: (u32, u32),
+    target: (u32, u32),
+    rotation: i64,
+) -> Option<(u32, u32)> {
+    // The target is the displayed picture; a quarter turn means the coded
+    // one is the other way round.
+    let (width, height) = crate::ffi::displayed(target.0, target.1, rotation);
+    let even = |side: u32| (side.max(2) + 1) & !1;
+    let (width, height) = (even(width), even(height));
+    (width < coded.0 && height < coded.1).then_some((width, height))
+}
+
+/// The device's own scaler, between the codec and the copy back: a graph
+/// of `buffer` - holding the codec's frames context, which is how a
+/// hardware frame enters a graph - into `scale_vaapi` into `buffersink`,
+/// built for one frames context, one coded size and one target, and built
+/// again when any of them changes. See [`shrink_size`].
+pub(crate) struct Shrinker {
+    key: (usize, u32, u32, u32, u32),
+    graph: ffmpeg::filter::Graph,
+}
+
+impl Shrinker {
+    /// `frame`, a VAAPI frame, shrunk to `size` on the device and still on
+    /// it, ready for [`download`]. `slot` keeps the graph between frames.
+    pub(crate) fn shrink(
+        slot: &mut Option<Shrinker>,
+        frame: &Video,
+        size: (u32, u32),
+        time_base: ffmpeg::Rational,
+    ) -> Result<Video, ffmpeg::Error> {
+        // SAFETY: a live frame; the frames context is null for a frame
+        // that is not on a device, which is refused below.
+        let frames = unsafe { (*frame.as_ptr()).hw_frames_ctx };
+        if frames.is_null() {
+            return Err(ffmpeg::Error::InvalidData);
+        }
+        let key = (
+            frames as usize,
+            frame.width(),
+            frame.height(),
+            size.0,
+            size.1,
+        );
+        if slot.as_ref().is_none_or(|shrinker| shrinker.key != key) {
+            *slot = None;
+            *slot = Some(Shrinker {
+                key,
+                graph: Self::build(frame, frames, size, time_base)?,
+            });
+        }
+        let graph = &mut slot.as_mut().expect("just built").graph;
+        graph
+            .get("in")
+            .ok_or(ffmpeg::Error::Bug)?
+            .source()
+            .add(frame)?;
+        let mut shrunk = Video::empty();
+        graph
+            .get("out")
+            .ok_or(ffmpeg::Error::Bug)?
+            .sink()
+            .frame(&mut shrunk)?;
+        Ok(shrunk)
+    }
+
+    fn build(
+        frame: &Video,
+        frames: *mut sys::AVBufferRef,
+        (width, height): (u32, u32),
+        time_base: ffmpeg::Rational,
+    ) -> Result<ffmpeg::filter::Graph, ffmpeg::Error> {
+        let mut graph = ffmpeg::filter::Graph::new();
+        let args = format!(
+            "video_size={}x{}:pix_fmt={}:time_base={}/{}:pixel_aspect=1/1",
+            frame.width(),
+            frame.height(),
+            Into::<sys::AVPixelFormat>::into(frame.format()).0,
+            time_base.numerator(),
+            time_base.denominator().max(1)
+        );
+        let buffer = ffmpeg::filter::find("buffer").ok_or(ffmpeg::Error::FilterNotFound)?;
+        let sink = ffmpeg::filter::find("buffersink").ok_or(ffmpeg::Error::FilterNotFound)?;
+        graph.add(&buffer, "in", &args)?;
+        graph.add(&sink, "out", "")?;
+        {
+            let mut source = graph.get("in").ok_or(ffmpeg::Error::Bug)?;
+            // SAFETY: the parameters are allocated here and freed below;
+            // buffersrc takes its own reference to the frames context, so
+            // the codec's stays the codec's.
+            unsafe {
+                let parameters = sys::av_buffersrc_parameters_alloc();
+                if parameters.is_null() {
+                    return Err(ffmpeg::Error::Other {
+                        errno: libc::ENOMEM,
+                    });
+                }
+                (*parameters).format = -1;
+                (*parameters).hw_frames_ctx = frames;
+                let ret = sys::av_buffersrc_parameters_set(source.as_mut_ptr(), parameters);
+                (*parameters).hw_frames_ctx = ptr::null_mut();
+                sys::av_free(parameters.cast());
+                if ret < 0 {
+                    return Err(ffmpeg::Error::from(ret));
+                }
+            }
+        }
+        // `hq` asks the chip for its better filter where its driver has
+        // one (Intel's); Mesa's takes the same picture either way. The
+        // format is left as it comes, NV12 or P010, so a ten-bit picture
+        // keeps its ten bits to the copy.
+        graph
+            .output("in", 0)?
+            .input("out", 0)?
+            .parse(&format!("scale_vaapi=w={width}:h={height}:mode=hq"))?;
+        graph.validate()?;
+        Ok(graph)
+    }
+}
+
+/// Writes down, once per process, that the device's scaler would not
+/// shrink a frame, and that frames are copied back whole instead: still on
+/// the device, only the copy is larger.
+pub(crate) fn note_shrink_refused(detail: &str) {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        log::warn!(
+            "VAAPI could not shrink a frame before copying it back; copying it whole: {detail}"
+        );
+    });
+}
+
 /// Writes down, once per process, that a reader gave up on the hardware
 /// and why. Once, because the reason is the same for every file after the
 /// first and the log is a person's, not a profiler's.
@@ -736,6 +882,33 @@ mod tests {
         );
         set_hardware_device(before);
         assert_eq!(hardware_device(), before);
+    }
+
+    /// A 4K picture shrinks to a Half monitor's size, the other way round
+    /// for a quarter turn, to even sides; a picture already no larger than
+    /// the target is copied back as it is.
+    #[test]
+    fn a_picture_shrinks_on_the_device_only_when_that_copies_less() {
+        assert_eq!(
+            shrink_size((3840, 2160), (1920, 1080), 0),
+            Some((1920, 1080))
+        );
+        assert_eq!(
+            shrink_size((3840, 2160), (1080, 1920), 90),
+            Some((1920, 1080))
+        );
+        assert_eq!(
+            shrink_size((3840, 2160), (1080, 1920), -90),
+            Some((1920, 1080))
+        );
+        assert_eq!(shrink_size((3840, 2160), (959, 539), 0), Some((960, 540)));
+        assert_eq!(shrink_size((1920, 1080), (1920, 1080), 0), None);
+        assert_eq!(shrink_size((1920, 1080), (3840, 2160), 0), None);
+        assert_eq!(
+            shrink_size((1920, 1080), (1920, 540), 0),
+            None,
+            "both sides must shrink"
+        );
     }
 
     #[test]
