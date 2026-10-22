@@ -27,7 +27,7 @@ use clap::{Parser, Subcommand};
 use concat_api::rpc::{Call, Message};
 use concat_core::time::{FrameRate, Rational};
 use concat_core::timeline::{Clip, MediaRef, Timeline, Track, TrackKind};
-use concat_media::{EncodeOptions, Encoder, FrameSink, ReaderPool};
+use concat_media::{EncodeOptions, Encoder, FrameSink, FrameSource, ReaderPool};
 use concat_render::{Compositor, WgpuCompositor, plan_frame};
 
 #[derive(Parser)]
@@ -598,8 +598,14 @@ fn bench(
         adapter.name,
         adapter.device_type,
         adapter.backend,
-        concat_media::HwPolicy::Preference
-            .device()
+        // The decoder this stream opens on, not the preference: 8-bit
+        // H.264 stays on the CPU whatever the machine has.
+        concat_media::Decoder::open(input, &concat_media::DecodeOptions::default())
+            .ok()
+            .and_then(|mut decoder| {
+                decoder.next_frame().ok()?;
+                decoder.hardware()
+            })
             .map_or("software", |device| device.label()),
         if compositor.has_pipeline_cache() {
             "on"
