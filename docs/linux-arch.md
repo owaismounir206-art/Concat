@@ -163,4 +163,5 @@ For example `CONCAT_LOG=debug concat`. Logs are in
 | Log says `VAAPI is not available, decoding in software` | `libva` or the VA driver is missing | AMD: `mesa` and `libva`; Intel: `intel-media-driver`; check `vainfo` |
 | Log says `VAAPI not chosen: no render node on a driver …` | Intel GPU on `i915` | Expected; `CONCAT_HWDEC=vaapi` forces it, at your own risk |
 | A stall the first time an effect is applied, every run | The cache folder cannot be written | Check that `~/.local/share/app.concat.editor/pipelines` is writable |
+| Crash at start (`SIGSEGV`) on a machine without an NVIDIA GPU, `nvidia_icd.json` in `/usr/share/vulkan/icd.d/` | `nvidia-utils` is installed and its Vulkan driver crashes the loader when there is no NVIDIA GPU | Remove it (`sudo pacman -Rns nvidia-utils lib32-nvidia-utils`), or start Concat with `VK_DRIVER_FILES=/usr/share/vulkan/icd.d/radeon_icd.json` (AMD) or `…/intel_icd.json` (Intel) |
 | The window does not open | No usable GPU at all | Start from a terminal with `CONCAT_LOG=debug concat` and include the log in a bug report |

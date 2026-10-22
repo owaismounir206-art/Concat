@@ -165,4 +165,5 @@ Per esempio `CONCAT_LOG=debug concat`. I log sono in
 | Il log dice `VAAPI is not available, decoding in software` | Manca `libva` o il driver VA | AMD: `mesa` e `libva`; Intel: `intel-media-driver`; controlla con `vainfo` |
 | Il log dice `VAAPI not chosen: no render node on a driver …` | GPU Intel con driver `i915` | È il comportamento previsto; `CONCAT_HWDEC=vaapi` lo forza, a tuo rischio |
 | Uno scatto la prima volta che applichi un effetto, a ogni avvio | La cartella della cache non è scrivibile | Controlla che `~/.local/share/app.concat.editor/pipelines` sia scrivibile |
+| Crash all'avvio (`SIGSEGV`) su un PC senza GPU NVIDIA, con `nvidia_icd.json` in `/usr/share/vulkan/icd.d/` | È installato `nvidia-utils` e il suo driver Vulkan fa crashare il loader quando non c'è una GPU NVIDIA | Rimuovilo (`sudo pacman -Rns nvidia-utils lib32-nvidia-utils`), oppure avvia Concat con `VK_DRIVER_FILES=/usr/share/vulkan/icd.d/radeon_icd.json` (AMD) o `…/intel_icd.json` (Intel) |
 | La finestra non si apre | Nessuna GPU utilizzabile | Avvia da terminale con `CONCAT_LOG=debug concat` e allega il log a una segnalazione |
