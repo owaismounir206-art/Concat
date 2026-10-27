@@ -227,6 +227,63 @@ struct ActiveClip {
     fade_in: f64,
     fade_out: f64,
     pcm: Arc<Pcm>,
+    /// Seconds into `pcm` where the clip's first sample lies: zero for a
+    /// span decoded for this clip, more for one played out of a wider span
+    /// decoded earlier; see [`Plain`].
+    offset: f64,
+}
+
+/// The part of a span's identity that says which samples it holds, for a
+/// span that is the file's sound and nothing else: at its own speed, with
+/// no chain. Such a span holds every sample of a narrower one of the same
+/// file, sample for sample, so a cut, a trim or a split played out of a span
+/// decoded before it needs no decode of its own; it plays out of the wider
+/// one at an offset. A span with a speed change or a chain is not plain:
+/// those filters carry state across the span's edges, and a narrower span's
+/// samples would not be the wider one's.
+#[derive(Clone, Debug, PartialEq)]
+struct Plain {
+    path: String,
+    audio_stream: Option<u32>,
+    start: f64,
+    window: f64,
+}
+
+impl Plain {
+    fn of(spec: &ClipSpec) -> Option<Self> {
+        (spec.speed == 1.0 && spec.chain.is_empty()).then(|| Self {
+            path: spec.path.clone(),
+            audio_stream: spec.audio_stream,
+            start: spec.source_start,
+            window: spec.duration,
+        })
+    }
+
+    /// Where `inner` starts inside this span, when this span holds all of
+    /// it. A hair of slack either side for the rounding the timeline's
+    /// seconds come with.
+    fn offset_of(&self, inner: &Plain) -> Option<f64> {
+        const SLACK: f64 = 1e-6;
+        (self.path == inner.path
+            && self.audio_stream == inner.audio_stream
+            && inner.start + SLACK >= self.start
+            && inner.start + inner.window <= self.start + self.window + SLACK)
+            .then(|| (inner.start - self.start).max(0.0))
+    }
+}
+
+/// The cached span `spec` plays out of, by key, and where in it the clip
+/// starts: its own span when decoded, else a plain one that holds it.
+fn find_span(cache: &HashMap<String, CacheEntry>, spec: &ClipSpec) -> Option<(String, f64)> {
+    let key = decode_key(spec);
+    if cache.contains_key(&key) {
+        return Some((key, 0.0));
+    }
+    let wanted = Plain::of(spec)?;
+    cache.iter().find_map(|(key, entry)| {
+        let offset = entry.plain.as_ref()?.offset_of(&wanted)?;
+        Some((key.clone(), offset))
+    })
 }
 
 /// A spec's gain keys as the engine's track.
@@ -385,6 +442,8 @@ struct DecodeQueue {
 struct CacheEntry {
     pcm: Arc<Pcm>,
     last_used: u64,
+    /// What the span holds, when it is plain; see [`Plain`].
+    plain: Option<Plain>,
 }
 
 /// The audio engine: decode workers, the supervised output stream, and the
@@ -572,7 +631,9 @@ impl Playback {
 
         for spec in specs {
             let key = decode_key(&spec);
-            if locked(&self.cache).contains_key(&key) {
+            // Its own span, or a wider plain one it plays out of: a cut or
+            // a trim of a clip already heard decodes nothing.
+            if find_span(&locked(&self.cache), &spec).is_some() {
                 continue;
             }
             if !locked(&self.decoding).insert(key.clone()) {
@@ -601,7 +662,8 @@ impl Playback {
         let active: Vec<ActiveClip> = specs
             .iter()
             .filter_map(|spec| {
-                let entry = cache.get_mut(&decode_key(spec))?;
+                let (key, offset) = find_span(&cache, spec)?;
+                let entry = cache.get_mut(&key)?;
                 entry.last_used = now;
                 Some(ActiveClip {
                     start: spec.start,
@@ -611,6 +673,7 @@ impl Playback {
                     fade_in: spec.fade_in,
                     fade_out: spec.fade_out,
                     pcm: Arc::clone(&entry.pcm),
+                    offset,
                 })
             })
             .collect();
@@ -624,8 +687,8 @@ impl Playback {
     /// space and page cache, not copies - but a long session accumulates a
     /// mapping per edit of every trimmed span, and those add up.
     fn evict_memory(&self) {
-        let live: HashSet<String> = locked(&self.specs).iter().map(decode_key).collect();
         let mut cache = locked(&self.cache);
+        let live = self.live_keys(&cache);
         while cache.len() > MEMORY_CACHE_CAP {
             let doomed = cache
                 .iter()
@@ -642,6 +705,21 @@ impl Playback {
         }
     }
 
+    /// The keys of every span the current clip set plays: each clip's own,
+    /// and the wider plain span one plays out of. Kept by both the memory
+    /// cap and the disk sweep, so a span a cut is playing out of is never
+    /// dropped from under it.
+    fn live_keys(&self, cache: &HashMap<String, CacheEntry>) -> HashSet<String> {
+        locked(&self.specs)
+            .iter()
+            .flat_map(|spec| {
+                let own = decode_key(spec);
+                let wider = find_span(cache, spec).map(|(key, _)| key);
+                std::iter::once(own).chain(wider)
+            })
+            .collect()
+    }
+
     /// Sweeps `cache/audio` down to [`DISK_CACHE_BUDGET`] on a worker
     /// thread: least-recently-modified first, never a file the current clip
     /// set is using. Old `.decoding` leftovers from crashed runs go too.
@@ -653,7 +731,7 @@ impl Playback {
         let spawned = std::thread::Builder::new()
             .name("audio-cache-sweep".into())
             .spawn(move || {
-                let live: HashSet<String> = locked(&this.specs).iter().map(decode_key).collect();
+                let live = this.live_keys(&locked(&this.cache));
                 let directory = project.join("cache").join("audio");
                 if let Some(doomed) = sweep_plan(&directory, &live, DISK_CACHE_BUDGET) {
                     for path in doomed {
@@ -706,6 +784,7 @@ fn decode_worker(playback: &Arc<Playback>) {
                     CacheEntry {
                         pcm: Arc::new(pcm),
                         last_used: now,
+                        plain: Plain::of(&job.spec),
                     },
                 );
             }
@@ -1149,7 +1228,7 @@ where
                         // Linear interpolation across the 48k source grid -
                         // exact when the device runs at 48k, inaudibly close
                         // when it does not.
-                        let read = local * f64::from(PCM_RATE);
+                        let read = (local + clip.offset) * f64::from(PCM_RATE);
                         let index = read.floor() as u64;
                         let fraction = (read - read.floor()) as f32;
                         let pcm = &clip.pcm;
@@ -1217,7 +1296,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{COAST, Shared, sweep_plan, wav_data_range};
+    use super::{COAST, ClipSpec, Plain, Shared, decode_key, sweep_plan, wav_data_range};
     use std::sync::atomic::Ordering;
 
     #[test]
@@ -1249,6 +1328,54 @@ mod tests {
         assert!(
             (5.01..=5.01 + COAST.as_secs_f64()).contains(&between),
             "{between}"
+        );
+    }
+
+    fn spec(start: f64, source_start: f64, duration: f64) -> ClipSpec {
+        ClipSpec {
+            path: "/media/take.mp4".to_owned(),
+            audio_stream: None,
+            start,
+            duration,
+            source_start,
+            volume: 1.0,
+            volume_curve: Vec::new(),
+            fade_in: 0.0,
+            fade_out: 0.0,
+            speed: 1.0,
+            preserve_pitch: true,
+            chain: String::new(),
+        }
+    }
+
+    /// The two halves of a cut, and a trim, play out of the span decoded
+    /// before them, at the offset their first sample has in it; a clip
+    /// reaching past it, another file, a speed change or a chain do not.
+    #[test]
+    fn a_cut_plays_out_of_the_span_it_was_cut_from() {
+        let whole = Plain::of(&spec(0.0, 2.0, 10.0)).expect("plain");
+        let first = Plain::of(&spec(0.0, 2.0, 4.0)).expect("plain");
+        let second = Plain::of(&spec(4.0, 6.0, 6.0)).expect("plain");
+        assert_eq!(whole.offset_of(&first), Some(0.0));
+        assert_eq!(whole.offset_of(&second), Some(4.0));
+        let trimmed = Plain::of(&spec(1.0, 3.5, 2.0)).expect("plain");
+        assert_eq!(whole.offset_of(&trimmed), Some(1.5));
+
+        let past = Plain::of(&spec(0.0, 9.0, 4.0)).expect("plain");
+        assert_eq!(whole.offset_of(&past), None, "it reaches past the span");
+        let mut elsewhere = spec(0.0, 2.0, 4.0);
+        elsewhere.path = "/media/other.mp4".to_owned();
+        assert_eq!(whole.offset_of(&Plain::of(&elsewhere).unwrap()), None);
+
+        let mut fast = spec(0.0, 2.0, 4.0);
+        fast.speed = 2.0;
+        assert!(Plain::of(&fast).is_none(), "a speed change is not plain");
+        let mut treated = spec(0.0, 2.0, 4.0);
+        treated.chain = "highpass=f=200".to_owned();
+        assert!(Plain::of(&treated).is_none(), "a chain is not plain");
+        assert_ne!(
+            decode_key(&spec(0.0, 2.0, 4.0)),
+            decode_key(&spec(4.0, 6.0, 6.0))
         );
     }
 

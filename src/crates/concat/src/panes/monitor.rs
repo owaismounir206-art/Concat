@@ -97,6 +97,29 @@ pub struct MonitorPane {
     /// Whether the current playback keeps up, and how far below the chosen
     /// quality it has stepped because it did not.
     strain: Strain,
+    /// The paused frame on show was read from proxies; the next request
+    /// reads the files themselves. See [`reads_proxies`].
+    refine: bool,
+}
+
+/// Whether a frame reads the files' proxies. Playback does at Half and
+/// Quarter; Full reads the files themselves, or Full would be the proxy
+/// blurred up. Paused, the frame after a cut, an effect or a click on the
+/// ruler is first read from the proxies too - a proxy has a keyframe every
+/// half second, the camera's file one every few seconds, and every one of
+/// those frames decodes from the keyframe before it - and then once more
+/// from the files (`refining`), so what stays on screen is the quality
+/// picked. With proxies off in Settings every frame reads the files, a
+/// proxy left from before included; with no clip under the playhead that
+/// has a proxy there is nothing to draft from.
+fn reads_proxies(
+    proxies: bool,
+    quality: usize,
+    moving: bool,
+    refining: bool,
+    any_proxy: bool,
+) -> bool {
+    proxies && quality > 0 && (moving || (any_proxy && !refining))
 }
 
 /// How far a playback that cannot keep up drops below the chosen quality.
@@ -260,6 +283,7 @@ impl MonitorPane {
                     }
                     Err(error) => Err(error),
                 };
+                let drafted = picture.is_ok() && !spec.moving && spec.proxy;
                 match picture {
                     Ok(image) => self.image = image,
                     Err(error) => {
@@ -271,6 +295,12 @@ impl MonitorPane {
                     }
                 }
                 if self.wanted {
+                    self.request(studio);
+                } else if drafted {
+                    // Paused on a frame read from proxies: the same frame
+                    // again from the files. Asked for anything since, that
+                    // goes first and is drafted the same way.
+                    self.refine = true;
                     self.request(studio);
                 }
             }
@@ -326,16 +356,22 @@ impl MonitorPane {
         let Some((clips, settings)) = studio.preview_clips() else {
             return;
         };
+        let time = f64::from(studio.preview_time());
+        let refining = std::mem::take(&mut self.refine);
+        let any_proxy = !moving && !refining && {
+            let pool = concat_host::scheduler().pool();
+            clips.iter().any(|clip| {
+                clip.start <= time
+                    && time < clip.start + clip.duration
+                    && pool.proxy_of(std::path::Path::new(&clip.path)).is_some()
+            })
+        };
         let spec = FrameSpec {
-            time: f64::from(studio.preview_time()),
+            time,
             width,
             height,
             moving,
-            // Playback reads the proxies at Half and Quarter; Full plays
-            // the files themselves, or Full would be the proxy blurred up.
-            // With proxies off in Settings it plays the files at every
-            // quality, a proxy left from before included.
-            proxy: studio.prefs.proxies && moving && quality > 0,
+            proxy: reads_proxies(studio.prefs.proxies, quality, moving, refining, any_proxy),
             color_space: studio.project().active().video.color_space,
         };
         if !studio.playing {
@@ -401,6 +437,20 @@ mod tests {
         assert_eq!(MonitorPane::frame_size(2, (0, 0)), (2, 2));
         // A tier past the picker's three is the smallest one.
         assert_eq!(MonitorPane::frame_size(9, (400, 400)), (100, 100));
+    }
+
+    #[test]
+    fn a_paused_frame_is_drafted_from_proxies_then_read_from_the_files() {
+        // Playing at Half or Quarter: the proxies, whatever else.
+        assert!(reads_proxies(true, 1, true, false, false));
+        assert!(reads_proxies(true, 2, true, true, true));
+        // Full and proxies off never read them.
+        assert!(!reads_proxies(true, 0, true, false, true));
+        assert!(!reads_proxies(false, 1, false, false, true));
+        // Paused: a draft where a clip has a proxy, then the files.
+        assert!(reads_proxies(true, 1, false, false, true));
+        assert!(!reads_proxies(true, 1, false, true, true));
+        assert!(!reads_proxies(true, 1, false, false, false));
     }
 
     #[test]

@@ -111,8 +111,14 @@ Cosa fa Concat da solo:
   salvato in `~/.local/share/app.concat.editor/pipelines/`. Dall'avvio successivo l'effetto
   compare subito.
 - **Qualità adattiva.** Se in un secondo la riproduzione perde più di un decimo dei frame,
-  Concat scende di un livello di qualità (Half → Quarter) fino allo stop. L'immagine in
-  pausa ha sempre la qualità che hai scelto.
+  Concat scende di un livello di qualità (Half → Quarter) fino allo stop.
+- **Modifiche rapide.** I proxy hanno un keyframe ogni mezzo secondo, quindi saltare a un
+  frame qualsiasi significa decodificarne pochi invece di centinaia. In pausa a Half o
+  Quarter, il frame dopo un taglio, un effetto o un clic sul righello viene mostrato prima
+  dal proxy e poi rifinito dal file originale, così l'immagine che resta ha la qualità che
+  hai scelto. Dopo un taglio, un trim o una divisione l'audio riparte da quello già
+  decodificato, senza decodificarlo di nuovo (a velocità 1× e senza filtri audio). I proxy
+  scritti dalle versioni precedenti vengono riscritti una volta, con i nuovi keyframe.
 
 Cosa puoi fare tu:
 

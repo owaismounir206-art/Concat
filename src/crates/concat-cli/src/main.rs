@@ -147,6 +147,26 @@ enum Command {
         target_fps: f64,
     },
 
+    /// Time the monitor through edits, the way a person makes them: the
+    /// clip plays from the start; partway through it is cut in two, and
+    /// later an effect is dropped on the second half, each without
+    /// stopping. Every frame's wait is logged against the edit before it,
+    /// so a stall after a cut or an effect is a number, not an impression.
+    BenchEdit {
+        /// The clip to play.
+        input: PathBuf,
+        /// The effect dropped on the second half after the cut.
+        #[arg(long, default_value = "concat.glow")]
+        effect: String,
+        /// The monitor's quality: full, half or quarter.
+        #[arg(long, default_value = "half")]
+        quality: String,
+        /// Seconds of playback in each phase: before the cut, after the
+        /// cut, after the effect.
+        #[arg(long, default_value_t = 2.0)]
+        phase: f64,
+    },
+
     /// Check effect packages before sharing them: load each folder the way
     /// the window does, hold its id against the built-ins, run its
     /// fixtures and its probes, and name every fault. `path` is one package folder - the
@@ -186,6 +206,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             height,
         } => preview(&input, &output, &effect, width, height),
         Command::Check { path } => check(&path),
+        Command::BenchEdit {
+            input,
+            effect,
+            quality,
+            phase,
+        } => bench_edit(&input, &effect, &quality, phase),
         Command::Bench {
             input,
             effects,
@@ -695,6 +721,145 @@ fn bench(
             "does not hold"
         }
     );
+    Ok(())
+}
+
+/// The bench through edits: see [`Command::BenchEdit`]. Playback runs on
+/// the wall clock, as the window's does: each frame is asked for at the
+/// instant it is due, the way the monitor asks once the frame before it is
+/// on screen, with decode-ahead handed the coming frames after each one.
+fn bench_edit(input: &Path, effect: &str, quality: &str, phase: f64) -> Result<(), Box<dyn Error>> {
+    use concat_export::{ClipKind, ExportClip};
+    use std::time::{Duration, Instant};
+
+    concat_media::set_hardware_decode(true);
+    let info = concat_media::probe(input)?;
+    let video = info.require_video()?;
+    let rate = video.frame_rate;
+    let fps = rate.fps().as_f64();
+    let (width, height) = bench_size(quality, (video.width, video.height))?;
+    let settings = concat_project::DocumentSettings {
+        name: "bench".to_owned(),
+        width: video.width,
+        height: video.height,
+        rate_num: rate.fps().numerator(),
+        rate_den: rate.fps().denominator(),
+    };
+    let length = phase * 3.0;
+    let clip = |start: f64, duration: f64, source_start: f64| {
+        let mut clip = ExportClip::blank(ClipKind::Video, start, duration, 0);
+        clip.path = input.to_string_lossy().into_owned();
+        clip.source_start = source_start;
+        clip.media_width = Some(video.width);
+        clip.media_height = Some(video.height);
+        clip
+    };
+    let whole = vec![clip(0.0, length, 0.0)];
+    let cut_at = phase * 1.5;
+    let cut = vec![
+        clip(0.0, cut_at, 0.0),
+        clip(cut_at, length - cut_at, cut_at),
+    ];
+    let mut treated = cut.clone();
+    treated[1]
+        .effects
+        .push(concat_project::model::AppliedFilter {
+            id: effect.to_owned(),
+            params: Default::default(),
+            enabled: true,
+            keys: Default::default(),
+        });
+
+    let monitor = concat_host::preview::Monitor::new();
+    println!(
+        "{}: {}x{} at {rate}, monitor {width}x{height} ({quality}); cut at {cut_at:.2}s, {effect} at {:.2}s",
+        input.display(),
+        video.width,
+        video.height,
+        phase * 2.0
+    );
+    if std::env::var_os("BENCH_EDIT_PROBE").is_some() {
+        let times: Vec<f64> = (75..95).map(|n| f64::from(n) / fps).collect();
+        for (n, t) in times.iter().enumerate() {
+            let spec = concat_host::preview::FrameSpec {
+                time: *t,
+                width,
+                height,
+                moving: true,
+                proxy: false,
+                color_space: Default::default(),
+            };
+            let at = Instant::now();
+            let list = match n {
+                0..=6 => whole.clone(),
+                7..=13 => cut.clone(),
+                _ => treated.clone(),
+            };
+            monitor.frame(Arc::new(list), &settings, spec)?;
+            println!(
+                "probe {n} t={t}: {:.1} ms",
+                at.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+        return Ok(());
+    }
+    let budget = Duration::from_secs_f64(1.0 / fps);
+    let started = Instant::now();
+    let mut phases: [Vec<(f64, Duration)>; 3] = Default::default();
+    let mut last_index = -1i64;
+    let mut skipped = [0u32; 3];
+    loop {
+        let time = started.elapsed().as_secs_f64();
+        if time >= length {
+            break;
+        }
+        let phase_index = ((time / phase) as usize).min(2);
+        let clips = Arc::new(match phase_index {
+            0 => whole.clone(),
+            1 => cut.clone(),
+            _ => treated.clone(),
+        });
+        let spec = concat_host::preview::FrameSpec {
+            time,
+            width,
+            height,
+            moving: true,
+            proxy: false,
+            color_space: Default::default(),
+        };
+        let asked = Instant::now();
+        monitor.frame(Arc::clone(&clips), &settings, spec)?;
+        let wait = asked.elapsed();
+        let index = (time * fps) as i64;
+        if last_index >= 0 && index > last_index + 1 {
+            skipped[phase_index] += (index - last_index - 1) as u32;
+        }
+        last_index = index;
+        phases[phase_index].push((time, wait));
+        {
+            let monitor = monitor.clone();
+            let settings = settings.clone();
+            std::thread::spawn(move || {
+                monitor.prefetch(clips, &settings, spec, concat_media::prefetch::AHEAD)
+            });
+        }
+    }
+    for (name, (frames, skipped)) in ["before the cut", "after the cut", "after the effect"]
+        .iter()
+        .zip(phases.iter().zip(skipped))
+    {
+        let waits: Vec<Duration> = frames.iter().map(|(_, wait)| *wait).collect();
+        let (mean, p95, worst) = spread(&waits);
+        let first = frames
+            .first()
+            .map_or(0.0, |(_, wait)| wait.as_secs_f64() * 1000.0);
+        let over = waits.iter().filter(|wait| **wait > budget).count();
+        println!(
+            "{name:17} first {first:7.1} ms  mean {mean:6.1}  p95 {p95:6.1}  worst {worst:7.1} ms  \
+             {over} of {} frames over budget, {skipped} timeline frames never shown",
+            frames.len()
+        );
+    }
     Ok(())
 }
 

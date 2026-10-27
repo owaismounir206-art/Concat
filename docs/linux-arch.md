@@ -110,8 +110,14 @@ What Concat does on its own:
   `~/.local/share/app.concat.editor/pipelines/`. The next run, and every run after,
   shows the effect at once.
 - **Adaptive quality.** When playback misses more than a tenth of its frames in a second,
-  it plays one quality tier smaller (Half → Quarter) until you stop. The paused picture is
-  always the quality you picked.
+  it plays one quality tier smaller (Half → Quarter) until you stop.
+- **Quick edits.** Proxies have a keyframe every half second, so jumping to any frame
+  decodes a handful of frames instead of hundreds. Paused at Half or Quarter, the frame
+  after a cut, an effect or a click on the ruler is shown first from the proxy and then
+  sharpened from the original file, so what stays on screen is the quality you picked.
+  After a cut, a trim or a split the audio plays from what was already decoded, with no
+  new decode (at 1× speed with no audio filters). Proxies written by earlier versions
+  are written again once, with the new keyframes.
 
 What you can do:
 

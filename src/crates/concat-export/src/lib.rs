@@ -1484,6 +1484,7 @@ fn render_picture(
         color_range: request.color_range,
         hardware: true,
         threads: 0,
+        keyframe_every: 0,
     };
     // An HDR file comes out of the compositor as its signal, sixteen bits a
     // channel; anything else, SDR - an HDR timeline's tone-mapped.

@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use concat_core::frame::Signal;
+use concat_core::time::FrameRate;
 use concat_media::decode::{DecodeOptions, Decoder, FrameSource};
 use concat_media::{ColorRange, EncodeOptions, Encoder, FrameSink, Priority, RateMode, VideoCodec};
 
@@ -31,6 +32,18 @@ const PIXELS_WITHOUT_PROXY: u64 = 1920 * 1080;
 /// shorter than [`SHORTEST_LONG_SIDE`].
 const DIVISOR: u32 = 4;
 const SHORTEST_LONG_SIDE: u32 = 960;
+
+/// Seconds between a proxy's keyframes. A proxy is read where the editor
+/// lands - a click on the ruler, the frame after a cut - and every one of
+/// those decodes from the keyframe before it: at the encoder's own spacing,
+/// ten seconds apart, that is up to some three hundred frames for the one
+/// shown. Half a second keeps it to a few, for a copy a few percent larger.
+const KEYFRAMES_EVERY: f64 = 0.5;
+
+/// [`KEYFRAMES_EVERY`] in frames at `rate`, at least one.
+fn keyframe_spacing(rate: FrameRate) -> u32 {
+    ((rate.fps().as_f64() * KEYFRAMES_EVERY).round() as u32).max(1)
+}
 
 /// Whether a `width` by `height` file is worth a proxy.
 pub fn wanted(width: u32, height: u32) -> bool {
@@ -72,6 +85,10 @@ pub fn path_for(
     if hdr {
         "hdr".hash(&mut hasher);
     }
+    // The keyframe spacing the copy is written with; see [`KEYFRAMES_EVERY`].
+    // Copies earlier builds wrote with the encoder's own, ten seconds
+    // apart, are written again and swept.
+    KEYFRAMES_EVERY.to_bits().hash(&mut hasher);
     if let Ok(modified) = meta.modified()
         && let Ok(since) = modified.duration_since(std::time::UNIX_EPOCH)
     {
@@ -238,6 +255,7 @@ pub fn write(
         // media engine does it for nothing where there is one.
         hardware: hdr,
         threads: 2,
+        keyframe_every: keyframe_spacing(rate),
     };
     let mut encoder = if hdr {
         Encoder::create_hdr(&partial, width, height, rate, &encoding, signal)
@@ -270,6 +288,14 @@ pub fn write(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_proxy_has_a_keyframe_every_half_second() {
+        assert_eq!(keyframe_spacing(FrameRate::from_int(30)), 15);
+        assert_eq!(keyframe_spacing(FrameRate::from_int(60)), 30);
+        assert_eq!(keyframe_spacing(FrameRate::FILM_NTSC), 12);
+        assert_eq!(keyframe_spacing(FrameRate::from_int(1)), 1);
+    }
 
     /// An HDR file's proxy keeps its signal: HEVC, HLG as the file is,
     /// its grey coming back as the same signal - under a name of its own,

@@ -24,6 +24,10 @@ serde_json.workspace = true
 # packages and runs their probes.
 concat-effects.workspace = true
 concat-host.workspace = true
+# `bench-edit` builds the monitor's clip list itself, as the window's
+# flattener would.
+concat-export.workspace = true
+concat-project.workspace = true
 clap.workspace = true
 
 [features]
