@@ -317,6 +317,26 @@ fn plan_access(current_next: Option<i64>, target: i64) -> Access {
     }
 }
 
+/// Whether a forward jump past [`ROLL_FORWARD_FRAMES`] is better made by
+/// decoding on from where the reader is: when the keyframe a seek to
+/// `target` would land on (`keyframe_before`, by frame index) is not past
+/// the reader's next frame, the seek would decode from there again
+/// everything the reader is about to decode anyway, and more. With long
+/// groups of pictures - a 4K web download, a keyframe every few seconds -
+/// that was a playback a frame late seeking on every frame, each seek
+/// costing seconds, and never catching up. Backwards, or with no index to
+/// ask, it is a seek as before.
+fn rolling_is_cheaper(
+    next: Option<i64>,
+    target: i64,
+    keyframe_before: impl FnOnce(i64) -> Option<i64>,
+) -> bool {
+    match next {
+        Some(next) if target > next => keyframe_before(target).is_some_and(|key| key <= next),
+        _ => false,
+    }
+}
+
 /// An even size no smaller than two on a side: what the scaler and the
 /// codecs are happiest with.
 fn even(width: u32, height: u32) -> (u32, u32) {
@@ -979,7 +999,15 @@ impl ReaderPool {
     ) -> Result<Option<Arc<Frame>>> {
         let rate = facts.rate;
         let next = (reader.next_index != i64::MIN).then_some(reader.next_index);
-        if !facts.still && plan_access(next, target) == Access::Seek {
+        if !facts.still
+            && plan_access(next, target) == Access::Seek
+            && !rolling_is_cheaper(next, target, |at| {
+                reader
+                    .decoder
+                    .keyframe_before(rate.time_of_frame(at))
+                    .map(|time| rate.frame_at(time))
+            })
+        {
             reader.seek(rate, target)?;
         }
 
@@ -1209,6 +1237,21 @@ pub(crate) mod tests {
     use crate::encode::{EncodeOptions, Encoder, FrameSink};
 
     #[test]
+    fn a_jump_ahead_inside_the_same_group_of_pictures_rolls_on() {
+        // The keyframe before the target is behind the reader: seeking
+        // would start again from there, so it rolls on.
+        assert!(rolling_is_cheaper(Some(100), 400, |_| Some(60)));
+        assert!(rolling_is_cheaper(Some(100), 400, |_| Some(100)));
+        // A keyframe between the reader and the target: the seek skips
+        // decoding, so it seeks.
+        assert!(!rolling_is_cheaper(Some(100), 400, |_| Some(300)));
+        // No index to ask, backwards, or no position: as before.
+        assert!(!rolling_is_cheaper(Some(100), 400, |_| None));
+        assert!(!rolling_is_cheaper(Some(100), 50, |_| Some(0)));
+        assert!(!rolling_is_cheaper(None, 400, |_| Some(0)));
+    }
+
+    #[test]
     fn the_access_policy_rolls_forward_and_seeks_backward() {
         assert_eq!(
             plan_access(Some(10), 10),
@@ -1348,6 +1391,66 @@ pub(crate) mod tests {
         }
         encoder.finish().expect("finishes");
         path
+    }
+
+    /// A jump ahead past the roll-forward distance, inside one group of
+    /// pictures, decodes on from where the reader is rather than seeking
+    /// back to the keyframe and decoding it all again.
+    #[test]
+    fn a_long_jump_inside_one_group_of_pictures_decodes_on() {
+        // One keyframe for all 200 frames. The picture never changes: a
+        // picture that does, however little, has x264 call it a new scene
+        // every second or so and put a keyframe there of its own.
+        let path =
+            std::env::temp_dir().join(format!("concat-pool-long-gop-{}.mp4", std::process::id()));
+        {
+            let mut encoder = Encoder::create(
+                &path,
+                64,
+                64,
+                FrameRate::THIRTY,
+                &EncodeOptions {
+                    keyframe_every: 300,
+                    ..EncodeOptions::default()
+                },
+            )
+            .expect("the linked FFmpeg encodes h264");
+            let mut frame = Frame::black(64, 64);
+            frame.fill([120, 40, 40, 255]);
+            for _ in 0..200 {
+                encoder.write_frame(&frame).expect("writes");
+            }
+            encoder.finish().expect("finishes");
+        }
+        let pool = ReaderPool::new(64 * 1024 * 1024, 4);
+        let rate = FrameRate::THIRTY;
+        let read = |index: i64| {
+            pool.frame_at(
+                &path,
+                rate.time_of_frame(index),
+                64,
+                64,
+                false,
+                None,
+                None,
+                None,
+                false,
+            )
+            .expect("frame decodes")
+        };
+        read(100);
+        read(190);
+        // Decoding on caches every frame passed; a seek to the keyframe
+        // drops those short of the target unseen. So a frame between the
+        // two is there only if the reader went on.
+        let before = pool.stats();
+        read(150);
+        let between = pool.stats().since(before);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(
+            between.decoded, 0,
+            "frame 150 was decoded again: the jump went back to the keyframe"
+        );
     }
 
     /// End to end against the linked FFmpeg: encode a tiny video whose frames

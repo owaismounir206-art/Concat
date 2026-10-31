@@ -815,6 +815,39 @@ impl Decoder {
         Ok(())
     }
 
+    /// Where a seek to `to` would start decoding: the time of the last
+    /// keyframe at or before it in the container's index, or `None` when
+    /// the index says nothing - no index, or one the demuxer has not read.
+    /// What lets a caller tell a seek that skips decoding from one that
+    /// only starts it again further back; see the reader pool's `pull`.
+    pub fn keyframe_before(&self, to: Rational) -> Option<Rational> {
+        let (num, den) = (
+            i64::from(self.time_base.numerator()),
+            i64::from(self.time_base.denominator()),
+        );
+        if num <= 0 || den <= 0 {
+            return None;
+        }
+        let ticks = ((to + self.start) * Rational::new(den, num)).floor();
+        let stream = self.input.stream(self.stream)?;
+        // SAFETY: the stream belongs to `self.input`, which outlives the
+        // call; the lookup only reads the stream's index, and the entry it
+        // returns is read at once, before anything could add to the index
+        // and move it.
+        let at = unsafe {
+            let entry = ffmpeg::sys::avformat_index_get_entry_from_timestamp(
+                stream.as_ptr().cast_mut(),
+                ticks,
+                ffmpeg::sys::AVSEEK_FLAG_BACKWARD,
+            );
+            if entry.is_null() {
+                return None;
+            }
+            (*entry).timestamp
+        };
+        ffi::seconds(at, self.time_base).map(|seconds| seconds - self.start)
+    }
+
     /// The next picture out of the codec, or `None` at the end of the file.
     /// Frames before the discard point never come out of here, and a frame
     /// from the device is copied back to memory before it does.
