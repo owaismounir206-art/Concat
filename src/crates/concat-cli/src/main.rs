@@ -167,6 +167,25 @@ enum Command {
         phase: f64,
     },
 
+    /// Time the monitor on a real project: its clips flattened as the
+    /// window flattens them, played on the wall clock from `--from` for
+    /// `--seconds`, with each second's waits and missed frames told apart,
+    /// so a stall at a transition or an effect is found by the second it
+    /// happens in. Reads the files, not their proxies: the worst case.
+    BenchProject {
+        /// The project folder, the one with `concat.json` in it.
+        project: PathBuf,
+        /// Where playback starts, in timeline seconds.
+        #[arg(long, default_value_t = 0.0)]
+        from: f64,
+        /// How long it plays.
+        #[arg(long, default_value_t = 8.0)]
+        seconds: f64,
+        /// The monitor's quality: full, half or quarter.
+        #[arg(long, default_value = "half")]
+        quality: String,
+    },
+
     /// Check effect packages before sharing them: load each folder the way
     /// the window does, hold its id against the built-ins, run its
     /// fixtures and its probes, and name every fault. `path` is one package folder - the
@@ -212,6 +231,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             quality,
             phase,
         } => bench_edit(&input, &effect, &quality, phase),
+        Command::BenchProject {
+            project,
+            from,
+            seconds,
+            quality,
+        } => bench_project(&project, from, seconds, &quality),
         Command::Bench {
             input,
             effects,
@@ -860,6 +885,107 @@ fn bench_edit(input: &Path, effect: &str, quality: &str, phase: f64) -> Result<(
             frames.len()
         );
     }
+    Ok(())
+}
+
+/// The bench on a project: see [`Command::BenchProject`]. Asked the way
+/// [`bench_edit`] asks - each frame at the instant it is due, decode-ahead
+/// handed the frames after it - and told by the second.
+fn bench_project(dir: &Path, from: f64, seconds: f64, quality: &str) -> Result<(), Box<dyn Error>> {
+    use std::time::{Duration, Instant};
+
+    concat_media::set_hardware_decode(true);
+    let document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("concat.json"))?)?;
+    let project = concat_project::from_document(&document)
+        .ok_or("concat.json holds no project this build can open")?;
+    let video = project.active().video;
+    let settings = concat_project::DocumentSettings {
+        name: document["name"].as_str().unwrap_or("bench").to_owned(),
+        width: video.width,
+        height: video.height,
+        rate_num: video.rate_num,
+        rate_den: video.rate_den,
+    };
+    let fps = video.rate().max(1.0);
+    let (width, height) = bench_size(quality, (video.width, video.height))?;
+    let clips = Arc::new(concat_export::flatten::flatten_timeline_in(
+        &project,
+        None,
+        Some(dir),
+    ));
+    println!(
+        "{}: {} clips, {}x{} at {fps:.3} fps, monitor {width}x{height} ({quality}), {from:.2}s to {:.2}s",
+        dir.display(),
+        clips.len(),
+        video.width,
+        video.height,
+        from + seconds
+    );
+
+    let monitor = concat_host::preview::Monitor::new();
+    let budget = Duration::from_secs_f64(1.0 / fps);
+    let started = Instant::now();
+    // Per timeline second: (waits, frames never shown).
+    let mut seconds_seen: std::collections::BTreeMap<i64, (Vec<Duration>, u32)> =
+        Default::default();
+    let mut last_index = -1i64;
+    loop {
+        let mut time = from + started.elapsed().as_secs_f64();
+        // The window asks once the frame under the clock changes, never
+        // twice for one: ahead of the next frame, wait for it.
+        let due = (last_index + 1) as f64 / fps;
+        if last_index >= 0 && time < due {
+            std::thread::sleep(Duration::from_secs_f64(due - time));
+            time = due;
+        }
+        if time >= from + seconds {
+            break;
+        }
+        let spec = concat_host::preview::FrameSpec {
+            time,
+            width,
+            height,
+            moving: true,
+            proxy: false,
+            color_space: video.color_space,
+        };
+        let asked = Instant::now();
+        monitor.frame(Arc::clone(&clips), &settings, spec)?;
+        let wait = asked.elapsed();
+        let index = (time * fps) as i64;
+        let entry = seconds_seen.entry(time.floor() as i64).or_default();
+        if last_index >= 0 && index > last_index + 1 {
+            entry.1 += (index - last_index - 1) as u32;
+        }
+        last_index = index;
+        entry.0.push(wait);
+        {
+            let monitor = monitor.clone();
+            let settings = settings.clone();
+            let clips = Arc::clone(&clips);
+            std::thread::spawn(move || {
+                monitor.prefetch(clips, &settings, spec, concat_media::prefetch::AHEAD)
+            });
+        }
+    }
+    let (mut all, mut missed) = (Vec::new(), 0);
+    for (second, (waits, skipped)) in &seconds_seen {
+        let (mean, p95, worst) = spread(waits);
+        let over = waits.iter().filter(|wait| **wait > budget).count();
+        println!(
+            "{second:5}s  mean {mean:7.1}  p95 {p95:7.1}  worst {worst:7.1} ms  \
+             {over} of {} frames over budget, {skipped} never shown",
+            waits.len()
+        );
+        all.extend_from_slice(waits);
+        missed += skipped;
+    }
+    let (mean, p95, worst) = spread(&all);
+    println!(
+        "all      mean {mean:7.1}  p95 {p95:7.1}  worst {worst:7.1} ms  {} frames shown, {missed} never shown",
+        all.len()
+    );
     Ok(())
 }
 

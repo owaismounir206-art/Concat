@@ -2039,11 +2039,13 @@ pub fn preview_sources(
 fn frame_request(
     plan: &PreviewPlan,
     layer: &concat_render::PlannedLayer,
+    at: Rational,
     (width, height): (u32, u32),
     still: bool,
     proxy: bool,
 ) -> concat_media::FrameRequest {
     concat_media::FrameRequest::new(&layer.media, layer.source_time, width, height)
+        .of_take(take_of(layer, at))
         .covering(plan.width.max(width), plan.height.max(height))
         .as_still(still)
         .from_proxy(proxy)
@@ -2053,6 +2055,21 @@ fn frame_request(
         // clip, unless a cutout has to cut it in eight bits.
         .at_any_size(true)
         .deep_when_untreated(!plan.built.cutouts.contains_key(&layer.clip))
+}
+
+/// The take `layer` reads at the instant `at`; see
+/// `concat_media::FrameRequest::of_take`. Where the file's clock stands
+/// against the timeline's, in milliseconds: the same at every frame of a
+/// clip played at one pace, and for both halves of a split one. A clip
+/// whose clock is a curve, or a held frame, has no such constant and is a
+/// take of its own by where it starts.
+fn take_of(layer: &concat_render::PlannedLayer, at: Rational) -> i64 {
+    let ms = |time: Rational| (time.as_f64() * 1000.0).round() as i64;
+    if layer.paced {
+        ms(layer.source_time - at * layer.speed)
+    } else {
+        ms(layer.clip_start) | (1 << 48)
+    }
 }
 
 /// [`preview_sources`] for one instant of a plan already built. With
@@ -2095,6 +2112,7 @@ pub fn preview_sources_of(
         match pool.frame(&frame_request(
             plan,
             layer,
+            plan_at.time,
             (decode_width, decode_height),
             stills.contains(&layer.clip),
             proxy,
@@ -2306,7 +2324,14 @@ pub fn preview_moments(
                             .get(&layer.clip)
                             .copied()
                             .unwrap_or((plan.width, plan.height));
-                        frame_request(plan, layer, size, stills.contains(&layer.clip), proxy)
+                        frame_request(
+                            plan,
+                            layer,
+                            plan_at.time,
+                            size,
+                            stills.contains(&layer.clip),
+                            proxy,
+                        )
                     })
                     .collect(),
             }

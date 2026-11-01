@@ -173,13 +173,18 @@ component Clip inherits Rectangle {
     /// An all-strip clip wears its kind's mark before its name, the way a
     /// look or a title is told from a sound on the lanes at a glance.
     property <bool> marked: root.all-strip;
-    property <length> text-x: root.marked ? 22px : 7px;
     /// The `fx` chip: a square sized to the strip it sits in, capped so a
     /// tall filter bar wears a rounded square and not a tall pill. A video
     /// header is too short for a square the word fits, so there it keeps
     /// the width it always had and stays a little wider than tall.
     property <length> chip: Math.min(root.header-h - 5px, 20px);
     property <length> chip-w: Math.max(root.chip, 14px);
+    /// At the head of the strip, before the name: the tail is where the
+    /// next clip's transition handle sits, and a chip there was under it.
+    property <bool> chipped: root.item.fx && root.width > 44px;
+    property <length> chip-x: root.marked ? 22px : 5px;
+    property <length> text-x: root.chipped ? root.chip-x + root.chip-w + 4px
+        : root.marked ? 22px : 7px;
     property <length> body-h: Math.max(0px, root.height - root.header-h);
     /// The sound band at the foot of a video clip: its file's waveform
     /// under its frames, a third of the body and never a sliver. A video
@@ -444,8 +449,7 @@ component Clip inherits Rectangle {
         if root.width > 30px: Text {
             x: root.text-x;
             y: 0;
-            width: parent.width - root.text-x - 7px
-                - (root.item.fx && root.width > 60px ? root.chip-w + 6px : 0px);
+            width: parent.width - root.text-x - 7px;
             height: parent.height;
             text: root.item.name;
             color: Theme.clip-ink;
@@ -467,8 +471,8 @@ component Clip inherits Rectangle {
 
         // An `fx` chip when effects are live on the clip, so a styled clip is
         // tellable from a plain one without opening a panel.
-        if root.item.fx && root.width > 60px: Rectangle {
-            x: parent.width - self.width - 4px;
+        if root.chipped: Rectangle {
+            x: root.chip-x;
             y: (parent.height - self.height) / 2;
             width: root.chip-w;
             height: root.chip;
@@ -1258,6 +1262,15 @@ export component Lanes inherits Rectangle {
     property <float> tick: Fmt.tick-interval(root.seconds-per-pixel);
     property <float> first-tick: root.tick > 0
         ? Math.ceil(root.scroll-left / root.tick) * root.tick : 0;
+    /// How many parts the marks between numbered ones cut a tick into:
+    /// fifths, or whatever lands on a round number for the steps that are
+    /// not five of anything - 15 s in fives, a minute in tens, two in
+    /// thirties. None at a frame a tick, which cannot be cut.
+    property <int> minor-ticks: root.tick < 0.05 ? 1
+        : root.tick == 15 ? 3
+        : root.tick == 30 || root.tick == 60 ? 6
+        : root.tick == 2 || root.tick == 120 ? 4
+        : 5;
 
     background: Theme.lane;
     clip: true;
@@ -1623,9 +1636,22 @@ export component Lanes inherits Rectangle {
 
                 Rectangle {
                     x: 0;
-                    y: parent.height - 7px;
+                    y: parent.height - 9px;
                     width: 1px;
-                    height: 7px;
+                    height: 9px;
+                    background: Theme.line-strong;
+                }
+
+                // The marks between the numbered ones, so a span can be
+                // read off the ruler without counting the gap by eye. Past
+                // the cell's own width: the cell is as wide as its label,
+                // the ruler clips them, and the next cell starts where the
+                // last of them would.
+                for minor in root.minor-ticks - 1: Rectangle {
+                    x: (minor + 1) * root.tick / root.minor-ticks * root.px-per-second;
+                    y: parent.height - 4px;
+                    width: 1px;
+                    height: 4px;
                     background: Theme.line-strong;
                 }
 
@@ -1634,8 +1660,9 @@ export component Lanes inherits Rectangle {
                     y: 0;
                     width: parent.width - 7px;
                     height: parent.height - 7px;
-                    text: Fmt.frames-timecode(parent.seconds, root.frame-rate);
-                    color: Theme.fg-dim;
+                    text: Fmt.ruler-label(parent.seconds, root.frame-rate, root.tick);
+                    color: Theme.fg-muted;
+                    font-family: Theme.font-technical;
                     font-size: Theme.fs-xs;
                     vertical-alignment: center;
                 }
@@ -1800,28 +1827,31 @@ export component Lanes inherits Rectangle {
         //
         // Over everything, ruler included: it is the one thing that must never
         // be behind a clip.
+        // Two pixels, centred on the instant: a hairline vanished against
+        // a filmstrip. The head is a tab over the ruler, the size of a
+        // fingertip's aim, with its point on the ruler's floor.
         Rectangle {
-            x: root.at(root.playhead);
+            x: root.at(root.playhead) - 1px;
             y: 0;
-            width: 1px;
+            width: 2px;
             height: root.height;
             background: Theme.playhead;
-            visible: self.x >= -1px && self.x <= root.width;
+            visible: self.x >= -2px && self.x <= root.width;
 
             Rectangle {
-                x: -5px;
-                y: 0;
-                width: 11px;
-                height: 9px;
+                x: -6px;
+                y: 2px;
+                width: 14px;
+                height: root.ruler-height - 6px;
 
                 Path {
                     width: parent.width;
                     height: parent.height;
-                    viewbox-width: 1;
-                    viewbox-height: 1;
+                    viewbox-width: 14;
+                    viewbox-height: 22;
                     fit: fill;
                     fill: Theme.playhead;
-                    commands: "M 0 0 L 1 0 L 0.5 1 Z";
+                    commands: "M 2 0 L 12 0 Q 14 0 14 2 L 14 14 L 7 22 L 0 14 L 0 2 Q 0 0 2 0 Z";
                 }
             }
         }

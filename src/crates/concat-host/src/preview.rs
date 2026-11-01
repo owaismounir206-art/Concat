@@ -17,16 +17,60 @@
 //! thread that owns the device - because the drawing is not a thing a
 //! worker may do; see `texture_of`.
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use concat_export::ExportClip;
 use concat_project::DocumentSettings;
 use concat_project::model::ColorSpace;
 
-/// How far ahead of the playhead playback opens the file a cut leads to;
-/// see [`Monitor::prefetch`].
-const NEXT_CUT: f64 = 1.0;
+/// How far ahead of the playhead playback opens what a cut leads to; see
+/// [`Monitor::prefetch`]. Three seconds, so a cold open has finished by the
+/// cut: a 4K web download keeps a keyframe every few seconds, the first
+/// frame after a seek decodes from the one before it, and on an integrated
+/// GPU that took two and a half seconds. And one second, so a cut that
+/// playback started closer to than three is still opened before it.
+const NEXT_CUTS: [f64; 2] = [1.0, 3.0];
+
+/// Whether two reads are on one reader: the same take of the same file
+/// (see `FrameRequest::of_take`). The incoming side of a transition across
+/// a cut from a file to itself is a take of its own, and is opened early
+/// on a reader of its own, as a file not read yet is.
+fn same_take(a: &concat_media::FrameRequest, b: &concat_media::FrameRequest) -> bool {
+    a.path == b.path && a.take == b.take
+}
+
+/// The first read of the take `found` at, found at the instant `at`:
+/// walked back a frame at a time while the instant before still reads
+/// it, never to `now` or before. A cut seen three seconds ahead is seen
+/// up to three seconds into it; opened there, its reader would be past
+/// every read the cut begins with, and each of those would seek it back.
+fn first_read(
+    plan: &concat_export::PreviewPlan,
+    now: f64,
+    at: f64,
+    found: concat_media::FrameRequest,
+    fps: f64,
+    proxy: bool,
+) -> concat_media::FrameRequest {
+    let frame = 1.0 / fps;
+    let (mut at, mut first) = (at, found);
+    while at - frame > now {
+        at -= frame;
+        let earlier = concat_export::preview_moments(plan, at - frame, 1, proxy)
+            .pop()
+            .and_then(|moment| {
+                moment
+                    .frames
+                    .into_iter()
+                    .find(|read| same_take(read, &first))
+            });
+        match earlier {
+            Some(read) => first = read,
+            None => break,
+        }
+    }
+    first
+}
 
 /// A frame request: the instant and the size, with the clips coming from
 /// the session that owns them.
@@ -60,9 +104,9 @@ pub struct Monitor {
     /// and scrubbing ask for many instants of one document, and the plan
     /// is the half of a frame that does not depend on the instant.
     plan: Arc<Mutex<Option<PlanEntry>>>,
-    /// The files a coming cut leads into that playback has already sent
-    /// to be opened early, so each is opened once and not once a frame.
-    early: Arc<Mutex<Vec<PathBuf>>>,
+    /// The takes a coming cut leads into that playback has already sent to
+    /// be opened early, so each is opened once and not once a frame.
+    early: Arc<Mutex<Vec<concat_media::FrameRequest>>>,
     #[cfg(feature = "gpu")]
     gpu: Option<Arc<Mutex<concat_render::WgpuCompositor>>>,
     /// A sibling of `gpu` that only ever compiles: each frame's new
@@ -343,14 +387,15 @@ impl Monitor {
             spec.proxy,
         );
         let fps = (settings.rate_num as f64 / settings.rate_den.max(1) as f64).max(1.0);
-        // The file a cut leads into, read a second early: opening a reader
-        // and seeking it costs more than the quarter second the frames
-        // ahead cover, so a cut would otherwise wait on it. Only files the
-        // frames ahead do not read already, and not pinned - this is to
-        // have the reader open and its first frames cached by the cut.
-        // Once per file: this runs every frame, the pool opens a reader
-        // outside its lock, and a file sent again before its first open
-        // finished would be opened again beside it.
+        // The take a cut leads into, read early from its first frame:
+        // opening a reader and seeking it costs more than the quarter second
+        // the frames ahead cover, so a cut would otherwise wait on it. A
+        // file the frames ahead do not read yet, or another take of one
+        // they do - the pool gives it a reader of its own - and never
+        // pinned: this is to have the reader open and its first frames
+        // cached by the cut. Once per take: this runs every frame, the pool
+        // opens a reader outside its lock, and a take sent again before its
+        // first open finished would be opened again beside it.
         let mut early = self
             .early
             .lock()
@@ -358,25 +403,42 @@ impl Monitor {
         if !spec.moving {
             early.clear();
         } else {
-            let far = concat_export::preview_moments(&plan, spec.time + NEXT_CUT, 1, spec.proxy)
-                .pop()
-                .map(|far| far.frames)
-                .unwrap_or_default();
-            let near = |path: &PathBuf| {
-                moments
-                    .iter()
-                    .any(|near| near.frames.iter().any(|read| &read.path == path))
-            };
-            // A file stays sent while a cut ahead or the frames ahead
-            // still read it; after that, a later cut into it opens it anew.
-            early.retain(|path| near(path) || far.iter().any(|read| &read.path == path));
-            let fresh: Vec<_> = far
-                .into_iter()
-                .filter(|request| {
-                    !request.still && !near(&request.path) && !early.contains(&request.path)
+            // Each read of the instants ahead, with the instant it is read
+            // at. `preview_moments` gives the instant a frame after the one
+            // it is asked from.
+            let far: Vec<(f64, concat_media::FrameRequest)> = NEXT_CUTS
+                .iter()
+                .flat_map(|ahead| {
+                    let at = spec.time + ahead;
+                    concat_export::preview_moments(&plan, at - 1.0 / fps, 1, spec.proxy)
+                        .pop()
+                        .map(|far| far.frames)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(move |read| (at, read))
                 })
                 .collect();
-            early.extend(fresh.iter().map(|request| request.path.clone()));
+            let near = |request: &concat_media::FrameRequest| {
+                moments
+                    .iter()
+                    .any(|near| near.frames.iter().any(|read| same_take(read, request)))
+            };
+            // A take stays sent while a cut ahead or the frames ahead still
+            // read it; after that, a later cut into it opens it anew.
+            early.retain(|sent| near(sent) || far.iter().any(|(_, read)| same_take(sent, read)));
+            let mut fresh: Vec<concat_media::FrameRequest> = Vec::new();
+            for (at, request) in far {
+                if !request.still
+                    && !near(&request)
+                    && !early
+                        .iter()
+                        .chain(&fresh)
+                        .any(|sent| same_take(sent, &request))
+                {
+                    fresh.push(first_read(&plan, spec.time, at, request, fps, spec.proxy));
+                }
+            }
+            early.extend(fresh.iter().cloned());
             if !fresh.is_empty() {
                 let pool = Arc::clone(&self.pool);
                 crate::scheduler().submit(concat_media::Priority::Filmstrip, move || {
@@ -410,5 +472,85 @@ impl Monitor {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use concat_export::{ClipKind, TransitionSpec};
+
+    /// Two clips of one file across a cut, the second from thirty seconds
+    /// further in and dissolving in over two: the transition starts a
+    /// second before the cut, at 9 s, reading the file from 29 s.
+    fn across_a_cut_to_itself() -> Arc<concat_export::PreviewPlan> {
+        let clip = |start: f64, source_start: f64| {
+            let mut clip = ExportClip::blank(ClipKind::Video, start, 10.0, 0);
+            clip.path = "/nowhere/take.webm".to_owned();
+            clip.source_start = source_start;
+            clip.media_width = Some(1920);
+            clip.media_height = Some(1080);
+            clip
+        };
+        let mut incoming = clip(10.0, 30.0);
+        incoming.transition = Some(TransitionSpec {
+            kind: "cross-fade".to_owned(),
+            duration: 2.0,
+        });
+        Arc::new(concat_export::preview_plan(
+            &[clip(0.0, 0.0), incoming],
+            960,
+            540,
+            24,
+            1,
+            ColorSpace::default(),
+        ))
+    }
+
+    fn reads_at(plan: &concat_export::PreviewPlan, at: f64) -> Vec<concat_media::FrameRequest> {
+        concat_export::preview_moments(plan, at - 1.0 / 24.0, 1, false)
+            .pop()
+            .map(|moment| moment.frames)
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn the_two_sides_of_a_transition_are_two_takes_of_the_file() {
+        let plan = across_a_cut_to_itself();
+        let reads = reads_at(&plan, 9.5);
+        assert_eq!(reads.len(), 2, "both sides read: {reads:?}");
+        assert!(!same_take(&reads[0], &reads[1]));
+        // Each side keeps its take from frame to frame. Before the cut:
+        // past it the outgoing side of a file of unknown length is a held
+        // frame, a take of its own.
+        let later = reads_at(&plan, 9.9);
+        for read in &reads {
+            assert!(later.iter().any(|next| same_take(read, next)));
+        }
+    }
+
+    /// A take found three seconds ahead, a second into the transition, is
+    /// opened from where the transition first reads it.
+    #[test]
+    fn a_take_found_ahead_opens_from_its_first_read() {
+        let plan = across_a_cut_to_itself();
+        let found = reads_at(&plan, 10.0)
+            .into_iter()
+            .max_by(|a, b| a.time.as_f64().total_cmp(&b.time.as_f64()))
+            .expect("the incoming side");
+        let first = first_read(&plan, 7.0, 10.0, found.clone(), 24.0, false);
+        assert!(same_take(&first, &found));
+        assert!(
+            (first.time.as_f64() - 29.0).abs() < 0.05,
+            "opened at {}",
+            first.time.as_f64()
+        );
+        // Never walked back to the playhead or before it.
+        let near = first_read(&plan, 9.5, 10.0, found, 24.0, false);
+        assert!(
+            near.time.as_f64() > 29.5 - 0.05,
+            "opened at {}",
+            near.time.as_f64()
+        );
     }
 }

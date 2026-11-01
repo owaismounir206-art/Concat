@@ -94,6 +94,9 @@ pub struct FrameRequest {
     /// go straight to the GPU. Only with `any_size`, since a fit here is
     /// FFmpeg on eight bits. See [`DecodeOptions::deep`].
     pub deep: bool,
+    /// Which take of the file this is: two reads of one take are on one
+    /// reader, two takes are on two. See [`FrameRequest::of_take`].
+    pub take: i64,
 }
 
 impl FrameRequest {
@@ -112,7 +115,21 @@ impl FrameRequest {
             range: None,
             any_size: false,
             deep: false,
+            take: 0,
         }
+    }
+
+    /// Reads on the reader of `take`: one stretch of the file played at
+    /// one pace, told by where its clock stands against the timeline's.
+    /// The two sides of a transition across a cut from a file to itself
+    /// read it seconds apart in every frame; on one reader each read sought
+    /// back to where the other had left it, and each seek decoded a group
+    /// of pictures again - seconds a frame on a 4K web download. Two
+    /// pieces of one take, split, are the same take: the reader decodes on
+    /// across the cut between them.
+    pub fn of_take(mut self, take: i64) -> Self {
+        self.take = take;
+        self
     }
 
     /// Reads the file as `range`, whatever it says. See
@@ -359,6 +376,25 @@ fn level_for(source: (u32, u32), cover: (u32, u32)) -> (u32, u32) {
     (width, height)
 }
 
+/// Where a reader is sent to land on frame `index`: half a frame before
+/// the frame's own time, never before zero. Frames are numbered with half
+/// a frame's give (see `Reader::next_frame`), and the decoder drops what is
+/// stamped before the time it is sent to. A file that counts in
+/// milliseconds - Matroska and WebM, every web download - stamps a 60 fps
+/// frame a fraction of a millisecond before its own time, so sent to that
+/// exact time the decoder dropped the very frame asked for and came back
+/// with the next: the frame asked for was never cached, the reader was
+/// past it, and every ask for it sought and decoded a group of pictures
+/// again - seconds a frame on a 4K download.
+fn landing(rate: FrameRate, index: i64) -> Rational {
+    let at = rate.time_of_frame(index) - rate.frame_duration() / Rational::from_int(2);
+    if at < Rational::ZERO {
+        Rational::ZERO
+    } else {
+        at
+    }
+}
+
 /// One warm reader: a decoder plus where its *next* frame will land.
 struct Reader {
     decoder: Decoder,
@@ -384,7 +420,7 @@ impl Reader {
         // and the index is read from that; a seek lands on the keyframe at
         // or before the target and the pull rolls forward from there.
         let mut options = DecodeOptions::default()
-            .starting_at(rate.time_of_frame(index))
+            .starting_at(landing(rate, index))
             .scaled_to(width, height)
             .in_range(range)
             .deep(deep);
@@ -424,7 +460,7 @@ impl Reader {
     }
 
     fn seek(&mut self, rate: FrameRate, index: i64) -> Result<()> {
-        self.decoder.seek(rate.time_of_frame(index))?;
+        self.decoder.seek(landing(rate, index))?;
         self.next_index = i64::MIN;
         Ok(())
     }
@@ -471,6 +507,7 @@ type ReaderKey = (
     Option<String>,
     Option<ColorRange>,
     bool,
+    i64,
 );
 
 /// The warm readers and their recency, behind one short lock. A reader is
@@ -819,7 +856,7 @@ impl ReaderPool {
     /// and the placement itself asks for.
     pub fn source(&self, request: &FrameRequest) -> Result<Arc<Frame>> {
         let (facts, key) = self.locate(request)?;
-        self.source_frame(&facts, &key)
+        self.source_frame(&facts, &key, request.take)
     }
 
     /// The frame a request describes: the source frame at its level,
@@ -837,7 +874,7 @@ impl ReaderPool {
             && request.chain.is_none()
             && (request.any_size || (source_key.width, source_key.height) == (width, height));
         if plain {
-            return self.source_frame(&facts, &source_key);
+            return self.source_frame(&facts, &source_key, request.take);
         }
         let key = TreatedKey {
             source: source_key,
@@ -851,7 +888,7 @@ impl ReaderPool {
             Self::count(&self.counters.treated_hits);
             return Ok(frame);
         }
-        let source = self.source_frame(&facts, &key.source)?;
+        let source = self.source_frame(&facts, &key.source, request.take)?;
         let treated = Arc::new(crate::treat::fit(
             &source,
             request.pre.as_deref(),
@@ -901,7 +938,7 @@ impl ReaderPool {
             deep: deep && chain.is_none() && pre.is_none(),
         };
         if chain.is_none() && pre.is_none() {
-            return self.source_frame(&facts, &source_key);
+            return self.source_frame(&facts, &source_key, 0);
         }
         let key = TreatedKey {
             source: source_key,
@@ -928,7 +965,9 @@ impl ReaderPool {
             self.remember_treated(key, Arc::clone(&frame));
             return Ok(frame);
         }
-        let shared = self.reader(path, width, height, chain, pre, range, false, &facts, index)?;
+        let shared = self.reader(
+            path, width, height, chain, pre, range, false, &facts, index, 0,
+        )?;
         let mut reader = shared.lock().map_err(|_| crate::error::Error::NoFrame {
             path: path.to_path_buf(),
         })?;
@@ -950,7 +989,7 @@ impl ReaderPool {
     }
 
     /// The source frame `key` names, from the cache or a reader.
-    fn source_frame(&self, facts: &MediaFacts, key: &SourceKey) -> Result<Arc<Frame>> {
+    fn source_frame(&self, facts: &MediaFacts, key: &SourceKey, take: i64) -> Result<Arc<Frame>> {
         if let Some(frame) = self.cached_source(key) {
             Self::count(&self.counters.source_hits);
             return Ok(frame);
@@ -964,7 +1003,7 @@ impl ReaderPool {
             return Ok(frame);
         }
         let shared = self.reader(
-            path, key.width, key.height, None, None, key.range, key.deep, facts, key.index,
+            path, key.width, key.height, None, None, key.range, key.deep, facts, key.index, take,
         )?;
         let mut reader = shared.lock().map_err(|_| crate::error::Error::NoFrame {
             path: path.to_path_buf(),
@@ -1031,6 +1070,16 @@ impl ReaderPool {
         // container that claims a frame more than it holds does not cost a
         // seek and a walk every time the end is asked for.
         if reached < target
+            && let Some(frame) = &latest
+        {
+            remember(target, Arc::clone(frame));
+        }
+        // And past it, where the stream has no frame numbered the target -
+        // a gap in a variable rate, or a stamp the numbering rounds over -
+        // the frame that answers it is remembered under it too: the reader
+        // is past the target now, and a second ask that found nothing in
+        // the cache would seek it back for the same answer.
+        if reached > target
             && let Some(frame) = &latest
         {
             remember(target, Arc::clone(frame));
@@ -1138,6 +1187,7 @@ impl ReaderPool {
         deep: bool,
         facts: &MediaFacts,
         target: i64,
+        take: i64,
     ) -> Result<Arc<Mutex<Reader>>> {
         let key = (
             path.to_path_buf(),
@@ -1147,6 +1197,7 @@ impl ReaderPool {
             pre.map(str::to_owned),
             range,
             deep,
+            take,
         );
         {
             let mut readers = self
@@ -1249,6 +1300,50 @@ pub(crate) mod tests {
         assert!(!rolling_is_cheaper(Some(100), 400, |_| None));
         assert!(!rolling_is_cheaper(Some(100), 50, |_| Some(0)));
         assert!(!rolling_is_cheaper(None, 400, |_| Some(0)));
+    }
+
+    /// A reader is sent half a frame before the frame it is to land on, so
+    /// a frame stamped a little early by a clock that counts in
+    /// milliseconds - frame 2042 of a 60 fps WebM, stamped 34.033 s, its
+    /// own time 34.0333 s - is not dropped by the decoder as before the
+    /// target. Never before zero.
+    #[test]
+    fn a_reader_lands_before_a_frame_stamped_just_early() {
+        let stamped = Rational::new(34_033, 1000);
+        assert!(landing(FrameRate::SIXTY, 2042) <= stamped);
+        assert!(
+            landing(FrameRate::SIXTY, 2042) > Rational::new(34_016, 1000),
+            "not the frame before"
+        );
+        assert_eq!(landing(FrameRate::SIXTY, 0), Rational::ZERO);
+        assert_eq!(landing(FrameRate::THIRTY, 30), Rational::new(59, 60));
+    }
+
+    /// The outgoing and incoming clips of a transition across a cut from a
+    /// file to itself are two takes of it, asked for in turn: each keeps a
+    /// reader at its own place, so neither seeks on the other's account.
+    #[test]
+    fn two_takes_of_one_file_asked_in_turn_keep_their_readers() {
+        let path = counting_video("two-takes", 32, 120);
+        let pool = ReaderPool::new(64 * 1024 * 1024, 4);
+        let at = |frame: i64, take: i64| {
+            FrameRequest::new(&path, FrameRate::THIRTY.time_of_frame(frame), 32, 32).of_take(take)
+        };
+        for i in 0..10 {
+            pool.frame(&at(10 + i, 0)).expect("outgoing decodes");
+            pool.frame(&at(90 + i, 2667)).expect("incoming decodes");
+        }
+        let mut places: Vec<i64> = {
+            let readers = pool.readers.lock().expect("lock");
+            readers
+                .warm
+                .values()
+                .map(|reader| reader.lock().expect("reader").next_index)
+                .collect()
+        };
+        places.sort_unstable();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(places, [20, 100], "one reader just past each take");
     }
 
     #[test]

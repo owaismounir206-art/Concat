@@ -6,12 +6,15 @@ import { Theme } from "../theme/theme.slint";
 import { Glyph, Icon } from "../icons.slint";
 import { IconButton } from "../primitives/panel.slint";
 import { ThinScrollbar } from "../primitives/scrollbar.slint";
-import { TrackData, TrackSize } from "model.slint";
+import { ClipKind, TrackData, TrackSize } from "model.slint";
 
 // The lane switches, in a fixed column beside the lanes.
 //
-// No label on a row: the lanes are untyped, so there is no kind to name, and
-// a lane's place in the stack is the only handle anything needs on it.
+// No name on a row: the lanes are untyped, so there is no kind to name. What
+// a row carries is its number - its place in the stack, counted up from the
+// bottom lane, the handle a lane is spoken of by - and the mark of what is on
+// it, so a stack of lanes reads as picture, titles, sound at a glance rather
+// than as rows of identical switches.
 //
 // Both a visibility and a mute toggle on every row, because a track is not
 // typed — the same lane can be carrying a video clip and an mp3 side by side,
@@ -220,6 +223,16 @@ component Header inherits Rectangle {
     callback sized(size: TrackSize);
     callback removed();
 
+    /// The mark of what the lane carries, as its clips wear it.
+    pure function mark() -> Glyph {
+        return root.track.content == ClipKind.audio ? Glyph.music
+            : root.track.content == ClipKind.image ? Glyph.image
+            : root.track.content == ClipKind.text ? Glyph.text-mark
+            : root.track.content == ClipKind.filter ? Glyph.filter
+            : root.track.content == ClipKind.shape ? Glyph.shapes
+            : Glyph.film;
+    }
+
     Rectangle {
         x: 0;
         y: parent.height - 1px;
@@ -247,6 +260,35 @@ component Header inherits Rectangle {
             // from the switches pressed all day, the way a form keeps
             // Delete away from Save. A narrow column takes the squeeze from
             // the gap, not from either end.
+
+            // The lane's number and the mark of what is on it. Dim on an
+            // empty lane, which has nothing to mark.
+            VerticalLayout {
+                alignment: start;
+                Rectangle {
+                    width: 30px;
+                    height: 26px;
+
+                    if !root.track.empty: Icon {
+                        x: 0;
+                        y: (parent.height - self.height) / 2;
+                        glyph: root.mark();
+                        size: 11px;
+                        tint: Theme.fg-muted;
+                    }
+
+                    Text {
+                        x: root.track.empty ? 2px : 14px;
+                        width: parent.width - self.x;
+                        height: parent.height;
+                        text: root.track.number;
+                        color: root.track.empty ? Theme.fg-dim : Theme.fg-muted;
+                        font-family: Theme.font-technical;
+                        font-size: Theme.fs-sm;
+                        vertical-alignment: center;
+                    }
+                }
+            }
 
             VerticalLayout {
                 alignment: start;

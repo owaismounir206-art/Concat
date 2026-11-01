@@ -93,6 +93,10 @@ pub const MIN_DURATION: f32 = 1.0 / 60.0;
 const LANE_LARGE: f32 = 108.0;
 const LANE_MEDIUM: f32 = 80.0;
 const LANE_SMALL: f32 = 44.0;
+/// An empty lane at Auto: room for its header's switches and a drop, and
+/// no more. At the middle height two empty lanes above a cut took the
+/// room the cut's own picture lane needed, and pushed it out of the pane.
+const LANE_EMPTY: f32 = 36.0;
 
 /// How long a title runs when it is placed: long enough to read, short
 /// enough that trimming it is a nudge rather than a fight.
@@ -997,6 +1001,39 @@ fn kind_of(clip: &Clip) -> ClipKind {
         model::ClipKind::Layer => ClipKind::Filter,
         model::ClipKind::Shape => ClipKind::Shape,
     }
+}
+
+/// Whether the Keyframes pane already shows `next`. A row holds a model of
+/// its keys, which compares by pointer, so the keys are compared one by one
+/// and the rest of the row as it is. Set whole every publish, the pane was
+/// torn down and built again on every frame of playback, keys or none.
+fn same_key_rows(shown: &VecModel<KeyRowData>, next: &[KeyRowData]) -> bool {
+    let bare = |row: &KeyRowData| KeyRowData {
+        keys: ModelRc::default(),
+        ..row.clone()
+    };
+    shown.row_count() == next.len()
+        && next.iter().enumerate().all(|(index, row)| {
+            shown
+                .row_data(index)
+                .is_some_and(|old| bare(&old) == bare(row) && old.keys.iter().eq(row.keys.iter()))
+        })
+}
+
+/// What a lane mostly carries, for the mark beside its number: a picture
+/// over a sound over a title, a look or a shape - the order of the room
+/// each takes, as `Studio::lane_height` sizes the lane. None when empty.
+fn lane_content(clips: &[std::sync::Arc<Clip>], lane: &str) -> Option<ClipKind> {
+    let rank = |kind: &ClipKind| match kind {
+        ClipKind::Video | ClipKind::Image => 0,
+        ClipKind::Audio => 1,
+        ClipKind::Text | ClipKind::Shape | ClipKind::Filter => 2,
+    };
+    clips
+        .iter()
+        .filter(|clip| clip.track_id == lane)
+        .map(|clip| kind_of(clip))
+        .min_by_key(rank)
 }
 
 fn align_of(align: TextAlign) -> TextAlignment {
@@ -2348,7 +2385,7 @@ impl Studio {
                         }
                     })
                     .fold(0.0_f32, f32::max);
-                if tallest > 0.0 { tallest } else { LANE_MEDIUM }
+                if tallest > 0.0 { tallest } else { LANE_EMPTY }
             }
         }
     }
@@ -7731,8 +7768,10 @@ impl Studio {
                 .tracks
                 .iter()
                 .rev()
-                .map(|lane| {
+                .enumerate()
+                .map(|(from_top, lane)| {
                     let height = self.lane_height(lane);
+                    let content = lane_content(&timeline.clips, &lane.id);
                     let row = TrackData {
                         id: lane.id.as_str().into(),
                         visible: lane.visible,
@@ -7741,6 +7780,9 @@ impl Studio {
                         size: self.lane_size(&lane.id),
                         height,
                         top,
+                        number: (timeline.tracks.len() - from_top) as i32,
+                        empty: content.is_none(),
+                        content: content.unwrap_or(ClipKind::Video),
                     };
                     top += height;
                     row
@@ -7869,9 +7911,12 @@ impl Studio {
         // The keyframe cluster's state, on its own global: every keyable row
         // in the inspector reads it, and none of them is threaded to.
         let keys = app.global::<Keyframes>();
-        // The Keyframes panel: set whole, since a row holds a model of its
-        // keys and cannot be compared for a diff.
-        models.key_editor_rows.set_vec(self.key_editor_rows());
+        // The Keyframes panel: set whole when anything in it changed; see
+        // `same_key_rows`.
+        let key_rows = self.key_editor_rows();
+        if !same_key_rows(&models.key_editor_rows, &key_rows) {
+            models.key_editor_rows.set_vec(key_rows);
+        }
         app.global::<KeyEditor>().set_at(
             self.sole_selection()
                 .and_then(|id| self.clip(&id))

@@ -64,6 +64,14 @@ export struct TrackData {
     /// nothing can be dropped onto it. A lane you can see and hear and still
     /// knock sideways by accident is the one every editor locks.
     locked: bool,
+    /// The lane's number, counted up from the bottom lane, which is 1: the
+    /// handle a lane is spoken of by - "the title on 3".
+    number: int,
+    /// What the lane mostly carries, for the mark beside its number: a
+    /// lane is untyped, but what is on it is not. Meaningless when `empty`.
+    content: ClipKind,
+    /// Nothing on the lane yet.
+    empty: bool,
 }
 
 /// A media item's filmstrip and the window of it one clip shows.
