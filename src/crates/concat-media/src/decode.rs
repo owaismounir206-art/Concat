@@ -1751,15 +1751,30 @@ mod tests {
         }
     }
 
-    /// A codec the device has no decoder for - a JPEG still, here - opens
+    /// A codec the device has no decoder for - a BMP still, here - opens
     /// in software straight away, with the device asked for, and decodes.
+    /// Not a JPEG: AMD's VCN decodes those, and VAAPI offers it.
     #[test]
     fn a_codec_the_device_lacks_decodes_in_software() {
         let path =
-            std::env::temp_dir().join(format!("concat-decode-jpeg-{}.jpg", std::process::id()));
-        let mut frame = Frame::black(64, 64);
-        frame.fill([200, 40, 40, 255]);
-        let bytes = crate::encode::jpeg(&frame, 90).expect("a jpeg");
+            std::env::temp_dir().join(format!("concat-decode-bmp-{}.bmp", std::process::id()));
+        // 64 by 64, 24 bits, bottom-up: a 54-byte header, then rows of
+        // blue, green, red, each 192 bytes and so already 4-aligned.
+        let (side, row) = (64u32, 64 * 3);
+        let size = 54 + row * side;
+        let mut bytes = Vec::with_capacity(size as usize);
+        bytes.extend_from_slice(b"BM");
+        for word in [size, 0, 54, 40, side, side] {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&24u16.to_le_bytes());
+        for word in [0u32, row * side, 2835, 2835, 0, 0] {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        for _ in 0..side * side {
+            bytes.extend_from_slice(&[40, 40, 200]);
+        }
         std::fs::write(&path, bytes).expect("writes the still");
         let device = HwDevice::platform_default().unwrap_or(HwDevice::VideoToolbox);
         let mut decoder = Decoder::open(&path, &DecodeOptions::default().accelerated(device))
@@ -1767,7 +1782,7 @@ mod tests {
         assert_eq!(
             decoder.hardware(),
             None,
-            "a JPEG is not the device's to decode"
+            "a BMP is not the device's to decode"
         );
         let decoded = decoder.next_frame().expect("decodes").expect("the picture");
         let _ = std::fs::remove_file(&path);
